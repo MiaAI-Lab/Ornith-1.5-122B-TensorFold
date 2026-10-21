@@ -82,7 +82,7 @@ A cached prefix resumes in about 0.6 s (17k prompt; resume points are every 4,09
 
 ```bash
 git clone https://github.com/MiaAI-Lab/Ornith-1.5-122B-TensorFold.git
-cd Ornith-1.5-122B
+cd Ornith-1.5-122B-TensorFold
 ./start.sh
 ```
 
