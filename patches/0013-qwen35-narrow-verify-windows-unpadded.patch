@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mia <mia.ailab1@gmail.com>
+Date: Wed, 21 Oct 2026 02:10:36 +0300
+Subject: [PATCH] qwen35 keep narrow verify windows unpadded (MTP exactness with the warp router)
+
+---
+ zig/src/families/qwen3_5/cuda_shapes.zig | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/qwen3_5/cuda_shapes.zig b/zig/src/families/qwen3_5/cuda_shapes.zig
+index c7f5c9c..fc08388 100644
+--- a/zig/src/families/qwen3_5/cuda_shapes.zig
++++ b/zig/src/families/qwen3_5/cuda_shapes.zig
+@@ -13,7 +13,9 @@ pub const Shape = struct {
+ 
+     pub fn init(rows: usize, segments: usize, record: bool, taps: bool, slots: u8) Shape {
+         std.debug.assert(rows > 0 and rows <= @as(usize, if (record) Round.most_verify else Round.max_rows) and segments > 0 and segments <= rows);
+-        const bucket: usize = if (rows == 1) 1 else std.mem.alignForward(usize, rows, 16);
++        // narrow windows keep their own width: with the warp-per-expert router a window padded to 16 rows (stale rows past its
++        // own) can differ in its real rows from the same rows run one at a time (MTP's 2 to 4 row windows, checked against no drafts)
++        const bucket: usize = if (rows <= 16) rows else std.mem.alignForward(usize, rows, 16);
+         const windows = std.math.ceilPowerOfTwo(usize, segments) catch unreachable;
+         return .{ .total = @intCast(if (record) bucket else rows), .nseg = @intCast(if (record) windows else segments), .record = record, .prompt = !record, .taps = taps, .slots = slots };
+     }

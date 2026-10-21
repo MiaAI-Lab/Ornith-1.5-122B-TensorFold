@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mia <mia.ailab1@gmail.com>
+Date: Wed, 21 Oct 2026 08:18:24 +0300
+Subject: [PATCH] qwen35 prompt passes of 4096 rows
+
+---
+ zig/src/cuda/exl3_candidate.zig           |  2 +-
+ zig/src/families/qwen3_5/cuda_engine.zig  | 10 ++++++----
+ zig/src/families/qwen3_5/cuda_forward.zig |  1 +
+ zig/src/families/qwen3_5/cuda_round.zig   |  2 +-
+ 4 files changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/zig/src/cuda/exl3_candidate.zig b/zig/src/cuda/exl3_candidate.zig
+index 775f41c..57341e0 100644
+--- a/zig/src/cuda/exl3_candidate.zig
++++ b/zig/src/cuda/exl3_candidate.zig
+@@ -44,7 +44,7 @@ pub const MatrixArgs = extern struct { k: u32, n: u32, bits: u32, tiles_n: u32,
+ /// Decode rows a launch; longer decode runs go window by window.
+ pub const window = 16;
+ /// Prompt rows a chunk: rotated to fp16 together, then 64 rows a block on the tensor units.
+-pub const prompt_chunk = 2048;
++pub const prompt_chunk = 4096;
+ /// Rows a prompt2 block takes (exl3_candidate.cu's TF_DENSE_TP).
+ const prompt2_rows = 128;
+ /// Blocks a launch aims for: a matrix with fewer 128-column blocks splits its input blocks into parts.
+diff --git a/zig/src/families/qwen3_5/cuda_engine.zig b/zig/src/families/qwen3_5/cuda_engine.zig
+index 9112cd6..748d477 100644
+--- a/zig/src/families/qwen3_5/cuda_engine.zig
++++ b/zig/src/families/qwen3_5/cuda_engine.zig
+@@ -20,7 +20,9 @@ const DeviceBuffer = cuda.DeviceBuffer;
+ const head_dim = geometry.head_dim;
+ 
+ /// Rows of one forward at most: a prompt chunk, or a shared round's windows.
+-pub const max_rows = 2048;
++pub const max_rows = 4096;
++/// Rows the scalar attention's partials hold (decode, verify windows, short pieces, and chunks the tensor-core kernel does not take).
++pub const attn_rows = 2048;
+ /// tf_q35_gdn_cscan's dynamic shared memory (qwen35_gdn_chunk.cuh's layouts), and the rows a block takes.
+ pub const gdn_scan_smem: u32 = 2 * 64 * 136 * 2 + 36 * 64 * 4 + 8 * 64 * 4 + 4 * 64 * 4;
+ pub const gdn_block = 64;
+@@ -370,9 +372,9 @@ pub const Engine = struct {
+         e.qraw = try t.alloc(R * 2 * g.attnWidth() * 2);
+         e.qn = try t.alloc(R * g.attnWidth() * 2);
+         inline for (.{ "kraw", "vraw", "kn" }) |name| @field(e, name) = try t.alloc(R * g.kv_heads * head_dim * 2);
+-        e.pm = try t.alloc(R * g.q_heads * max_chunks * 4);
+-        e.pl = try t.alloc(R * g.q_heads * max_chunks * 4);
+-        e.po = try t.alloc(R * g.q_heads * max_chunks * head_dim * 4);
++        e.pm = try t.alloc(attn_rows * g.q_heads * max_chunks * 4);
++        e.pl = try t.alloc(attn_rows * g.q_heads * max_chunks * 4);
++        e.po = try t.alloc(attn_rows * g.q_heads * max_chunks * head_dim * 4);
+         e.logits = try t.alloc(most_verify * g.vocab * 2);
+         if (g.moe()) e.routed = try routed.Scratch.carve(t, g, R);
+         e.amax = try t.alloc(most_verify * argmaxSlices(g.vocab) * 8);
+diff --git a/zig/src/families/qwen3_5/cuda_forward.zig b/zig/src/families/qwen3_5/cuda_forward.zig
+index fb2fa01..9369d86 100644
+--- a/zig/src/families/qwen3_5/cuda_forward.zig
++++ b/zig/src/families/qwen3_5/cuda_forward.zig
+@@ -93,6 +93,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
+                     const args = .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), e.y };
+                     if (e.kv8) try e.runShared(e.fp8.attn_prompt, grid, .{ attn_prompt_rows * 32, 1, 1 }, E.prompt_smem8, args) else try e.run(e.fns.attn_prompt, grid, .{ attn_prompt_rows * 32, 1, 1 }, args);
+                 } else {
++                    if (total > E.attn_rows) return error.TooManyRows; // the partials hold attn_rows rows
+                     try e.run(if (e.kv8) e.fp8.attn_partial else e.fns.attn_partial, .{ max_chunks, g.kv_heads, total }, .{ 32 * group, 1, 1 }, .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po });
+                     try e.run(e.fns.attn_merge, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.y });
+                 }
+diff --git a/zig/src/families/qwen3_5/cuda_round.zig b/zig/src/families/qwen3_5/cuda_round.zig
+index dc6a435..6f1a59c 100644
+--- a/zig/src/families/qwen3_5/cuda_round.zig
++++ b/zig/src/families/qwen3_5/cuda_round.zig
+@@ -4,7 +4,7 @@ const slots = @import("core").tree_slots;
+ const Seg = @import("cuda_cache.zig").Seg;
+ const Rule = @import("cuda").sample.Rule;
+ pub const Path = @import("cuda_cache.zig").Path;
+-pub const max_rows = 2048;
++pub const max_rows = 4096;
+ pub const max_segs = 128;
+ pub const most_verify = 128;
+ pub const most_window = 64;

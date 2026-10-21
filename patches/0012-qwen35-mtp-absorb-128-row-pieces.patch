@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mia <mia.ailab1@gmail.com>
+Date: Wed, 21 Oct 2026 02:55:38 +0300
+Subject: [PATCH] qwen35 MTP absorbs in 128-row pieces (generic EXL3 paths take 128 rows)
+
+---
+ zig/src/families/qwen3_5/cuda_mtp.zig       | 6 ++++--
+ zig/src/families/qwen3_5/cuda_mtp_check.zig | 2 +-
+ 2 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/families/qwen3_5/cuda_mtp.zig b/zig/src/families/qwen3_5/cuda_mtp.zig
+index d8d170d..0e1ba16 100644
+--- a/zig/src/families/qwen3_5/cuda_mtp.zig
++++ b/zig/src/families/qwen3_5/cuda_mtp.zig
+@@ -13,7 +13,9 @@ const DeviceBuffer = cuda.DeviceBuffer;
+ const dr = lanes.drafter;
+ const Stream = lanes.Stream;
+ const head_dim = geometry.head_dim;
+-const max_rows = engine.max_rows;
++/// The MTP layer's rows a call: its EXL3 matmuls and grouped experts are the generic paths, which take 128 rows at most
++/// (the target's prompt pass takes engine.max_rows through the fused prompt kernels), so a long absorb runs in pieces of this.
++const max_rows = 128;
+ const most_window = engine.most_window;
+ 
+ /// Drafts a round at most (the frozen engine's DEPTH); TF_MTP_DRAFTS=N sets it, up to a window's rows less one.
+@@ -375,7 +377,7 @@ pub const Mtp = struct {
+         if (rows_) |rs| if (rs.len != n or n > most_window) return error.BadDraftRows;
+         if (start < ctx.end) ctx.end = start;
+         if (start > ctx.end) ctx.begin = start; // a gap (a prompt restored from a cache): the context starts here
+-        const held = engine.tap_rows - max_rows; // the target's ring holds this many rows behind its newest
++        const held = engine.tap_rows - engine.max_rows; // the target's ring holds this many rows behind its newest
+         if (n > held) {
+             fi = n - held;
+             start += n - held;
+diff --git a/zig/src/families/qwen3_5/cuda_mtp_check.zig b/zig/src/families/qwen3_5/cuda_mtp_check.zig
+index 464fd87..b427b0d 100644
+--- a/zig/src/families/qwen3_5/cuda_mtp_check.zig
++++ b/zig/src/families/qwen3_5/cuda_mtp_check.zig
+@@ -3,7 +3,7 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const lanes = @import("lanes");
+ const Mtp = @import("cuda_mtp.zig").Mtp;
+-const max_rows = @import("cuda_engine.zig").max_rows;
++const max_rows = 128; // cuda_mtp.zig's rows a call
+ 
+ /// Siblings 0 and 1 at depth 0, six siblings 3 to 8 at depth 1, lane 9 at depth 2 under 3 and 0; each has a child.
+ const parents = [_]i32{ -1, -1, -1, 0, 0, 0, 0, 1, 1, 3, 4, 5, 6, 7, 8, 9 };

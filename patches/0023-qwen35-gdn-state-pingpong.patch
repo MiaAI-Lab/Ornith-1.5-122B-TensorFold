@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mia <mia.ailab1@gmail.com>
+Date: Wed, 21 Oct 2026 09:05:57 +0300
+Subject: [PATCH] qwen35 GDN state ping-pong
+
+---
+ zig/kernels/cuda/qwen35.cu              |  7 +++++--
+ zig/kernels/cuda/qwen35_slots.cuh       | 10 +++++-----
+ zig/src/families/qwen3_5/cuda_cache.zig |  5 ++++-
+ 3 files changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/zig/kernels/cuda/qwen35.cu b/zig/kernels/cuda/qwen35.cu
+index dd5d858..c39ca35 100644
+--- a/zig/kernels/cuda/qwen35.cu
++++ b/zig/kernels/cuda/qwen35.cu
+@@ -228,8 +228,11 @@ extern "C" __global__ void tf_q35_conv_commit(Geo geo, const __nv_bfloat16* __re
+             }
+         }
+         if (sg.rows != 1) return;
+-        __nv_bfloat16* before = reinterpret_cast<__nv_bfloat16*>(sg.before + geo.nl * geo.rec() * sizeof(float)) + (size_t)layer * geo.conv_rows();
+-        for (int r = 0; r < TAPS - 1; ++r) before[(size_t)r * C + c] = CS[(size_t)r * C + c];
++        // the new tail goes beside the old one (qwen35_slots.cuh): the buffer holding it replaces the stream's state
++        __nv_bfloat16* next = reinterpret_cast<__nv_bfloat16*>(sg.before + geo.nl * geo.rec() * sizeof(float)) + (size_t)layer * geo.conv_rows();
++        for (int r = 0; r < TAPS - 1; ++r)
++            next[(size_t)r * C + c] = r + 1 < TAPS - 1 ? CS[(size_t)(r + 1) * C + c] : QKV[(size_t)sg.row0 * C + c];
++        return;
+     }
+     // ascending: slot r takes [r + rows], which is either a later state slot (not yet written) or a row
+     for (int r = 0; r < TAPS - 1; r++) {
+diff --git a/zig/kernels/cuda/qwen35_slots.cuh b/zig/kernels/cuda/qwen35_slots.cuh
+index 879c676..a9df2fc 100644
+--- a/zig/kernels/cuda/qwen35_slots.cuh
++++ b/zig/kernels/cuda/qwen35_slots.cuh
+@@ -13,12 +13,12 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
+     constexpr int PT = DK / 32;
+     const size_t at = ((size_t)hv * DK + dv) * DK + PT * dk;
+     float* st = reinterpret_cast<float*>(sg.rec) + (size_t)layer * geo.rec() + at;
++    // a one-row round leaves the old state where it is (Cache.before afterwards) and writes the new one beside it, in the
++    // buffer the host then swaps in (Cache.advanced): no copy of the old state, one state write a step rather than two
++    float* nst = sg.rows == 1 ? reinterpret_cast<float*>(sg.before) + (size_t)layer * geo.rec() + at : st;
+     float root[PT], kept[SLOTS][PT], state[PT];
+ #pragma unroll
+-    for (int i = 0; i < PT; ++i) {
+-        root[i] = st[i];
+-        if (sg.rows == 1) reinterpret_cast<float*>(sg.before)[(size_t)layer * geo.rec() + at + i] = root[i];
+-    }
++    for (int i = 0; i < PT; ++i) root[i] = st[i];
+ #pragma unroll
+     for (int slot = 0; slot < SLOTS; ++slot)
+ #pragma unroll
+@@ -75,7 +75,7 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
+     }
+     if (record && sg.rows != 1) return;
+ #pragma unroll
+-    for (int i = 0; i < PT; ++i) st[i] = state[i];
++    for (int i = 0; i < PT; ++i) nst[i] = state[i];
+ }
+ #define TF_Q35_SLOTS(N) \
+ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_slots_##N(Geo geo, const __nv_bfloat16* q, \
+diff --git a/zig/src/families/qwen3_5/cuda_cache.zig b/zig/src/families/qwen3_5/cuda_cache.zig
+index b737c0c..59be3b0 100644
+--- a/zig/src/families/qwen3_5/cuda_cache.zig
++++ b/zig/src/families/qwen3_5/cuda_cache.zig
+@@ -18,7 +18,7 @@ pub const Cache = struct {
+     untaught: bool = false,
+     delta: i32 = 0,
+     state: DeviceBuffer,
+-    /// The exact state before a recorded one-row round advances its stable slot in place.
++    /// The exact state before a recorded one-row round: that round writes its new state here and `advanced` swaps the buffers.
+     before: ?DeviceBuffer = null,
+     kv: DeviceBuffer,
+     /// A drafter's tapped rows (`Engine.taps`), a ring of tap_rows: the row at position p in slot p % tap_rows.
+@@ -58,6 +58,9 @@ pub const Cache = struct {
+ 
+     /// Publish a completed forward's metadata, including one-row slots that already advanced in place.
+     pub fn advanced(self: *Cache, rows: usize, record: bool) void {
++        // a recorded one-row round wrote its new recurrences and conv tail into `before` and left the old ones in `state`
++        // (qwen35_slots.cuh, tf_q35_conv_commit): the buffers trade places, so `before` is the exact state before the round
++        if (record and rows == 1) std.mem.swap(DeviceBuffer, &self.state, &self.before.?);
+         self.last = if (record) .{ .start = self.len, .rows = rows } else null;
+         self.len += rows;
+         self.written = self.len;

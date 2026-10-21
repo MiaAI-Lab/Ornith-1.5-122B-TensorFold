@@ -1,0 +1,76 @@
+diff --git a/zig/src/families/qwen3_5/cuda_draft_config.zig b/zig/src/families/qwen3_5/cuda_draft_config.zig
+index 24553d2..43e0479 100644
+--- a/zig/src/families/qwen3_5/cuda_draft_config.zig
++++ b/zig/src/families/qwen3_5/cuda_draft_config.zig
+@@ -80,8 +80,8 @@ pub const Config = struct {
+             c.taps[i] = @intCast(t.integer);
+         }
+         c.n_taps = taps.array.items.len;
+-        // what the kernels fix: the head width, two-tap convolutions, a block of 8, the selector's top-k within a row
+-        if (c.head_dim != 128 or try int(d.object, "conv_kernel_size") != 2 or c.block != 8 or c.topk > lp_top or c.mask >= c.vocab) return error.UnsupportedDraftConfig;
++        // what the kernels fix: the head width, two-tap convolutions, a block of 8 or 16 (served as 16), the selector's top-k within a row
++        if (c.head_dim != 128 or try int(d.object, "conv_kernel_size") != 2 or (c.block != 8 and c.block != 16) or c.topk > lp_top or c.mask >= c.vocab) return error.UnsupportedDraftConfig;
+         if (c.hidden != target.hidden or c.vocab != target.vocab or c.hidden % 256 != 0 or c.hidden % c.group != 0 or c.heads % c.kv_heads != 0 or c.layers > 8) return error.UnsupportedDraftConfig;
+         _ = std.math.mul(usize, c.heads, c.head_dim) catch return error.UnsupportedDraftConfig;
+         _ = std.math.mul(usize, c.kv_heads, c.head_dim) catch return error.UnsupportedDraftConfig;
+diff --git a/zig/src/families/qwen3_5/cuda_native_moe.zig b/zig/src/families/qwen3_5/cuda_native_moe.zig
+index 5d0f4b0..8eb9593 100644
+--- a/zig/src/families/qwen3_5/cuda_native_moe.zig
++++ b/zig/src/families/qwen3_5/cuda_native_moe.zig
+@@ -1,4 +1,6 @@
+ //! The qwen3_5_moe model type (Qwen3.6-35B-A3B) on the same CUDA engine: routed experts in place of the dense MLP.
++const std = @import("std");
++const lanes = @import("lanes");
+ const native = @import("cuda_native.zig");
+ 
+ pub const model_type = "qwen3_5_moe";
+@@ -10,7 +12,31 @@ pub const prompt_rows = native.prompt_rows;
+ pub const takes_drafter = true;
+ pub const Options = native.Options;
+ pub const open = native.open;
+-pub const openDrafter = native.openMtp;
++/// --drafter names a DFlash2 draft model (its config.json has dflash_config) or the checkpoint's own MTP layer.
++pub fn openDrafter(gpa: std.mem.Allocator, io: std.Io, p: *anyopaque, dir: []const u8, bits: u8) !Opened {
++    if (try isDflash(gpa, io, dir)) {
++        const o = try native.openDrafter(gpa, io, p, dir, bits);
++        return .{ .drafter = o.drafter, .ctx = o.ctx, .close = o.close, .reserve = o.reserve, .prepare = .{ .ctx = o.prepare.ctx, .run = o.prepare.run, .bytes = o.prepare.bytes } };
++    }
++    const o = try native.openMtp(gpa, io, p, dir, bits);
++    return .{ .drafter = o.drafter, .ctx = o.ctx, .close = o.close, .reserve = o.reserve, .prepare = null };
++}
++
++pub const Opened = struct {
++    drafter: lanes.drafter.Drafter,
++    ctx: *anyopaque,
++    close: *const fn (*anyopaque) void,
++    reserve: *const fn (*anyopaque, u32) anyerror!void,
++    prepare: ?struct { ctx: *anyopaque, run: *const fn (*anyopaque) anyerror!lanes.drafter.Facts, bytes: usize },
++};
++
++fn isDflash(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !bool {
++    const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
++    defer gpa.free(path);
++    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch return false;
++    defer gpa.free(bytes);
++    return std.mem.indexOf(u8, bytes, "\"dflash_config\"") != null;
++}
+ pub const explain = native.explain;
+ /// The dense family's kept prompt states, its open refusals' words and its image tower: the MLP is the only change.
+ pub const snap_bytes = native.snap_bytes;
+diff --git a/zig/src/native/cuda_drafted.zig b/zig/src/native/cuda_drafted.zig
+index c0cd746..fe53d0c 100644
+--- a/zig/src/native/cuda_drafted.zig
++++ b/zig/src/native/cuda_drafted.zig
+@@ -66,7 +66,11 @@ pub fn wrap(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, loaded:
+     s.facts = h.drafted.facts(loaded.facts);
+     s.stream_bytes = h.drafted.streamBytes(loaded.stream_bytes);
+     s.held = h;
+-    if (@hasField(@TypeOf(opened), "prepare")) s.prepare = .{ .ctx = opened.prepare.ctx, .run = opened.prepare.run, .bytes = if (@hasField(@TypeOf(opened.prepare), "bytes")) opened.prepare.bytes else 0 };
++    if (@hasField(@TypeOf(opened), "prepare")) {
++        // a family whose drafter may or may not need a calibration pass returns it optional
++        const prep = if (@typeInfo(@TypeOf(opened.prepare)) == .optional) opened.prepare else @as(?@TypeOf(opened.prepare), opened.prepare);
++        if (prep) |pp| s.prepare = .{ .ctx = pp.ctx, .run = pp.run, .bytes = if (@hasField(@TypeOf(pp), "bytes")) pp.bytes else 0 };
++    }
+     return s;
+ }
+ 

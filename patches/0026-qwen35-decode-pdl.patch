@@ -1,0 +1,508 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mia <mia.ailab1@gmail.com>
+Date: Wed, 21 Oct 2026 09:12:20 +0300
+Subject: [PATCH] qwen35 decode PDL
+
+---
+ zig/kernels/cuda/exl3_candidate.cu            |  4 +++
+ zig/kernels/cuda/exl3_experts.cu              | 23 ++++++++++++
+ zig/kernels/cuda/experts.cu                   |  2 ++
+ zig/kernels/cuda/moe.cu                       |  4 +++
+ zig/kernels/cuda/pdl.cuh                      | 19 ++++++++++
+ zig/kernels/cuda/qwen35.cu                    | 11 ++++++
+ zig/kernels/cuda/qwen35_argmax.cuh            |  3 ++
+ zig/kernels/cuda/qwen35_bf16.cu               |  3 ++
+ zig/kernels/cuda/qwen35_kv8.cu                |  4 +++
+ zig/kernels/cuda/qwen35_slots.cuh             |  2 ++
+ zig/src/cuda/launch.zig                       | 35 ++++++++++++++++++-
+ zig/src/families/qwen3_5/cuda_engine.zig      |  5 +++
+ .../families/qwen3_5/cuda_exl3_weights.zig    |  1 +
+ 13 files changed, 115 insertions(+), 1 deletion(-)
+ create mode 100644 zig/kernels/cuda/pdl.cuh
+
+diff --git a/zig/kernels/cuda/exl3_candidate.cu b/zig/kernels/cuda/exl3_candidate.cu
+index 03697f9..63c61c0 100644
+--- a/zig/kernels/cuda/exl3_candidate.cu
++++ b/zig/kernels/cuda/exl3_candidate.cu
+@@ -1,5 +1,6 @@
+ // EXL3 projections on CUDA: trellis tiles as stored ([K/16, N/16, 16 bits] int16), core/exl3_format.zig's codebooks.
+ #include "exl3_candidate.cuh"
++#include "pdl.cuh"
+ 
+ struct TfExl3Rows {
+   unsigned rows, x_stride, y_stride, y_f32;
+@@ -251,6 +252,7 @@ TF_EXL3_PROMPT2(2)
+ // Decode rows for the tensor units: tf_exl3_rotate_h's values, each 128-block in fragment order (t4, r, 4 halves).
+ extern "C" __global__ void __launch_bounds__(32) tf_exl3_rotate_f(const __nv_bfloat16* X, unsigned x_stride, const __half* suh,
+                                                                   __half* R, unsigned r_stride) {
++    tf_pdl_begin();
+   const unsigned lane = threadIdx.x, row = blockIdx.y, base = blockIdx.x * 128;
+   float v[4];
+   for (int q = 0; q < 4; ++q) {
+@@ -327,6 +329,7 @@ __device__ __forceinline__ void tf_exl3_tc_job(const __half* Xh, const uint8_t*
+     }
+   };
+   uint4 A[NJ], B[NJ];
++  tf_pdl_trigger();            // the next kernel's blocks may come up; this one's weights do not wait for the one before
+   if (b0 < b1) {
+     ldstage(A, b0);
+     ststage(A, 0);
+@@ -334,6 +337,7 @@ __device__ __forceinline__ void tf_exl3_tc_job(const __half* Xh, const uint8_t*
+     ldstage(B, b0 + 2);
+     __syncthreads();
+   }
++  tf_pdl_wait();               // the rotated rows, the split counters and the partial sums belong to the kernels before
+ #pragma unroll 1
+   for (unsigned ib = b0; ib < b1; ib += 2) {
+     decode(ib, 0);                       // stage ib is in slot 0 (ib - b0 even), A holds ib + 1, B holds ib + 2
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index eb1bddf..882fcd2 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -3,6 +3,7 @@
+ #include <cstdint>
+ #include <cuda_bf16.h>
+ #include <cuda_fp16.h>
++#include "pdl.cuh"
+ 
+ #include "exl3_decode.cuh"
+ 
+@@ -189,6 +190,14 @@ __device__ __forceinline__ bool gd_tiles(const GroupedArgs& a, const uint32_t* T
+     uint4 A[S::NJ], B[S::NJ];
+     gd_span_load<K2, NT>(A, T, kstride, kt0, nkt, nt0, 0, lane);
+     gd_span_load<K2, NT>(B, T, kstride, kt0, nkt, nt0, 1, lane);
++    {   // the rest of the warp's spans (the down projection's whole range, the first of the gate/up's) into L2 ahead of the loop
++        const int pf = a.mats == 1 ? nkt : (nkt < 4 ? nkt : 4);
++        constexpr int LPS = (S::WORDS * 4 + 127) / 128;   // 128-byte lines a span covers
++        for (int i = lane; i < (pf - 2) * LPS && pf > 2; i += 32) {
++            const char* p = reinterpret_cast<const char*>(T + (size_t)(kt0 + 2 + i / LPS) * kstride + (size_t)nt0 * S::TW) + 128 * (i % LPS);
++            asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
++        }
++    }
+     if (threadIdx.x < 16) {
+         const int m = mtile * 16 + threadIdx.x;
+         const int count = a.standard ? a.uids[3 * u + 2] : a.maxm;
+@@ -198,6 +207,7 @@ __device__ __forceinline__ bool gd_tiles(const GroupedArgs& a, const uint32_t* T
+     }
+     __syncthreads();
+     if (rows_sh[0] < 0) return false;   // members come first, so this tile is empty
++    tf_pdl_wait();                       // plan_rotate's rotated rows (and every earlier kernel's writes) from here on
+     const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
+     const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * a.k + 2 * t;
+     const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * a.k + 2 * t;
+@@ -351,14 +361,17 @@ extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1,
+ 
+ // Decode's grouped kernels: NT = GD_NT tiles (32 columns) a block, so a projection has 4x the blocks and no half-empty wave.
+ extern "C" __global__ void tf_exl3_gd_0(tf_exl3::GroupedArgs a) {
++    tf_pdl_trigger();   // the plan it reads is complete (plan_rotate waited for it before letting this launch); only the rotated rows are not
+     tf_exl3::gd_body<0, tf_exl3::GD_NT, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+ }
+ 
+ extern "C" __global__ void tf_exl3_gd_1(tf_exl3::GroupedArgs a) {
++    tf_pdl_trigger();   // the plan it reads is complete (plan_rotate waited for it before letting this launch); only the rotated rows are not
+     tf_exl3::gd_body<1, tf_exl3::GD_NT, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+ }
+ 
+ extern "C" __global__ void tf_exl3_gd_2(tf_exl3::GroupedArgs a) {
++    tf_pdl_trigger();   // the plan it reads is complete (plan_rotate waited for it before letting this launch); only the rotated rows are not
+     tf_exl3::gd_body<2, tf_exl3::GD_NT, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+ }
+ 
+@@ -596,6 +609,8 @@ struct PlanStage {
+ // The shared expert's own plan for a decode window of `rows` rows: one item (the expert, members 0 .., count rows) over the
+ // pairs row * slots + slots - 1, in row order as the full plan lists them; run on a side stream before the router has picked.
+ extern "C" __global__ void tf_exl3_shared_plan(int* items, int* counts, int* members, int rows, int slots, int expert) {
++    tf_pdl_wait();
++    tf_pdl_trigger();   // only now: the kernel after reads what the plan kernels before wrote, and they are complete
+     if (threadIdx.x < rows) members[threadIdx.x] = threadIdx.x * slots + slots - 1;
+     if (threadIdx.x == 0) {
+         items[0] = expert;
+@@ -606,6 +621,13 @@ extern "C" __global__ void tf_exl3_shared_plan(int* items, int* counts, int* mem
+ }
+ 
+ extern "C" __global__ void tf_exl3_plan_rotate(const PlanStage a) {
++    if (a.slots != 0) {   // gate/up: the gd after it reads the plan, which must be complete before it is let in
++        tf_pdl_wait();
++        tf_pdl_trigger();
++    } else {              // down: the plan has been complete since the gate/up gd launched
++        tf_pdl_trigger();
++        tf_pdl_wait();
++    }
+     const int it = blockIdx.x, blk = blockIdx.y, mat = blockIdx.z;
+     if (it >= a.counts[0]) return;
+     const int e = a.items[3 * it], first = a.items[3 * it + 1], count = a.items[3 * it + 2];
+@@ -624,6 +646,7 @@ extern "C" __global__ void tf_exl3_plan_rotate(const PlanStage a) {
+ }
+ 
+ extern "C" __global__ void tf_exl3_plan_finish(const PlanStage a) {
++    tf_pdl_begin();
+     const int it = blockIdx.x, blk = blockIdx.y, lane = threadIdx.x;
+     if (it >= a.counts[0]) return;
+     const int e = a.items[3 * it], first = a.items[3 * it + 1], count = a.items[3 * it + 2];
+diff --git a/zig/kernels/cuda/experts.cu b/zig/kernels/cuda/experts.cu
+index e41adf8..4753211 100644
+--- a/zig/kernels/cuda/experts.cu
++++ b/zig/kernels/cuda/experts.cu
+@@ -2,6 +2,7 @@
+ 
+ #include <cuda_bf16.h>
+ #include <stdint.h>
++#include "pdl.cuh"
+ 
+ #include "experts.cuh"
+ 
+@@ -205,6 +206,7 @@ __device__ int place_items(int c, int E, int T, int* __restrict__ items, int* __
+ __global__ void __launch_bounds__(PLAN_THREADS)
+     plan_kernel(const int* __restrict__ picks, int P, int E, int T, int* __restrict__ members,
+                 int* __restrict__ items, int* __restrict__ counts) {
++    tf_pdl_begin();
+   __shared__ int pk[PSMALL];
+   __shared__ int cnt[EMAX];
+   __shared__ int off[EMAX];
+diff --git a/zig/kernels/cuda/moe.cu b/zig/kernels/cuda/moe.cu
+index 956600c..aefd1be 100644
+--- a/zig/kernels/cuda/moe.cu
++++ b/zig/kernels/cuda/moe.cu
+@@ -3,6 +3,7 @@
+ #include <cuda_bf16.h>
+ #include <math.h>
+ #include <stdint.h>
++#include "pdl.cuh"
+ 
+ namespace {
+ 
+@@ -105,6 +106,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_moe_router_t(const __nv_bfl
+ extern "C" __global__ void __launch_bounds__(128) tf_moe_router_rows(const __nv_bfloat16* __restrict__ X, int x_stride,
+                                                                        const __nv_bfloat16* __restrict__ W, float* __restrict__ OUT,
+                                                                        int R, int D, int E) {
++    tf_pdl_begin();
+     const int e = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+     if (e >= E) return;
+     float acc[16];
+@@ -144,6 +146,7 @@ __device__ __forceinline__ bool beats(float v, int i, float bv, int bi) { return
+ // Row r by a warp: TOPK experts by logit (ties to the lower id), weights bf16(exp(l - top) / sum), the shared slot.
+ extern "C" __global__ void __launch_bounds__(32) tf_moe_topk(const float* __restrict__ L, int* __restrict__ PICK,
+                                                               float* __restrict__ WT, int NE, int TOPK) {
++    tf_pdl_begin();
+     const int64_t r = blockIdx.x;
+     const int lane = threadIdx.x;
+     const int NL = NE + 1, SLOTS = TOPK + 1;  // L[r][NE], the shared gate's logit, weighs slot TOPK by bf16(sigmoid(bf16(it)))
+@@ -194,6 +197,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_moe_topk(const float* __rest
+ // OUT[r][d] = bf16(sum over slots in order of fma(w[r][s], y[r][s][d])); y fp32 (decode) or bf16 (prompt rows).
+ extern "C" __global__ void __launch_bounds__(256) tf_moe_combine(const void* __restrict__ Y, int y_f32, const float* __restrict__ WT,
+                                                                    __nv_bfloat16* __restrict__ OUT, int S, int D) {
++    tf_pdl_begin();
+     const int64_t r = blockIdx.x;
+     for (int d = blockIdx.y * 256 + threadIdx.x; d < D; d += gridDim.y * 256) {
+         float acc = 0.0f;
+diff --git a/zig/kernels/cuda/pdl.cuh b/zig/kernels/cuda/pdl.cuh
+new file mode 100644
+index 0000000..cab2cf1
+--- /dev/null
++++ b/zig/kernels/cuda/pdl.cuh
+@@ -0,0 +1,19 @@
++// Programmatic dependent launch (sm_90+): a kernel launched with the PDL attribute may start (its blocks resident, running the
++// code before tf_pdl_wait) while the kernel before it finishes; tf_pdl_wait returns once that kernel is complete and its writes
++// visible. Launched without the attribute both are no-ops, so converted kernels run unchanged from any launch.
++#pragma once
++__device__ __forceinline__ void tf_pdl_wait() {
++#if __CUDA_ARCH__ >= 900
++    asm volatile("griddepcontrol.wait;\n" ::: "memory");
++#endif
++}
++__device__ __forceinline__ void tf_pdl_trigger() {
++#if __CUDA_ARCH__ >= 900
++    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
++#endif
++}
++// The usual start of a converted kernel: let the next kernel's blocks come up, wait for the previous one's results.
++__device__ __forceinline__ void tf_pdl_begin() {
++    tf_pdl_trigger();
++    tf_pdl_wait();
++}
+diff --git a/zig/kernels/cuda/qwen35.cu b/zig/kernels/cuda/qwen35.cu
+index 58de9dc..f618137 100644
+--- a/zig/kernels/cuda/qwen35.cu
++++ b/zig/kernels/cuda/qwen35.cu
+@@ -3,6 +3,7 @@
+ #include "qwen35.cuh"
+ #include "qwen35_attn_prompt.cuh"
+ #include "qwen35_gdn_chunk.cuh"
++#include "pdl.cuh"
+ 
+ using namespace tf_q35;
+ 
+@@ -63,6 +64,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_splice(__nv_bfloat16* _
+ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __restrict__ H, const __nv_bfloat16* __restrict__ R,
+                                                                const __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ X, float eps, int D,
+                                                                const int* __restrict__ P, float* __restrict__ XS) {
++    tf_pdl_begin();
+     constexpr int MAXE = 32;
+     __shared__ float red[8];
+     __shared__ __align__(16) __nv_bfloat16 xrow[8192];
+@@ -160,6 +162,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_gdn_pre(Geo geo, const _
+                                                                   __nv_bfloat16* __restrict__ Q, __nv_bfloat16* __restrict__ K,
+                                                                   __nv_bfloat16* __restrict__ V, float* __restrict__ G, __nv_bfloat16* __restrict__ BETA,
+                                                                   const int* __restrict__ P) {
++    tf_pdl_begin();
+     const int lane = threadIdx.x;
+     const int head = blockIdx.y;
+     const int w = blockIdx.z;
+@@ -214,6 +217,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_gdn_pre(Geo geo, const _
+ // A segment's conv tail: a recorded window logs each row's for keep and leaves the stream's; others update it in place.
+ extern "C" __global__ void tf_q35_conv_commit(Geo geo, const __nv_bfloat16* __restrict__ QKV, const Seg* __restrict__ segs,
+                                                 const int* __restrict__ rowpar, int layer, const int* __restrict__ P) {
++    tf_pdl_begin();
+     const int C = geo.conv();
+     const int c = blockIdx.x * blockDim.x + threadIdx.x;
+     if (c >= C || past_windows(P, blockIdx.y)) return;
+@@ -440,6 +444,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_prompt(Geo geo, con
+ extern "C" __global__ void __launch_bounds__(32) tf_q35_gdn_post(Geo geo, const __nv_bfloat16* __restrict__ Y, const __nv_bfloat16* __restrict__ Z,
+                                                                    const __nv_bfloat16* __restrict__ NW, float eps, __nv_bfloat16* __restrict__ OUT,
+                                                                    const int* __restrict__ P) {
++    tf_pdl_begin();
+     const int lane = threadIdx.x, hv = blockIdx.y;
+     if (past_rows(P, blockIdx.z)) return;
+     const size_t m = blockIdx.z;
+@@ -466,6 +471,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_gdn_post(Geo geo, const
+ extern "C" __global__ void __launch_bounds__(64) tf_q35_head_norm(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
+                                                                     __nv_bfloat16* __restrict__ OUT, int heads, int stride, int hstride, float eps,
+                                                                     const int* __restrict__ P) {
++    tf_pdl_begin();
+     __shared__ float sums[2];
+     const int head = blockIdx.x % heads;
+     if (past_rows(P, blockIdx.x / heads)) return;
+@@ -505,6 +511,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_rope(Geo geo, __nv_bflo
+                                                                 const __nv_bfloat16* __restrict__ Vr, const Seg* __restrict__ segs,
+                                                                 const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                                                 const int* __restrict__ P, const int* __restrict__ M) {
++    tf_pdl_begin();
+     rope_rows(geo, Qn, Kn, Vr, segs, rowseg, rowanc, P, M, StoreBf16{layer, geo.kvh});
+ }
+ 
+@@ -513,6 +520,7 @@ extern "C" __global__ void tf_q35_attn_partial(Geo geo, const __nv_bfloat16* __r
+                                                  const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                                  const int* __restrict__ P, float scale,
+                                                  float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
++    tf_pdl_begin();
+     constexpr int DPL = HD / 32;
+     const int QH = geo.qh, KVH = geo.kvh;
+     const int lane = threadIdx.x & 31, g = threadIdx.x >> 5;
+@@ -578,6 +586,7 @@ extern "C" __global__ void __launch_bounds__(512, ATT_MB) tf_q35_attn_partial_b(
+                                                  const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                                  const int* __restrict__ P, float scale,
+                                                  float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
++    tf_pdl_begin();
+     constexpr int DPL = HD / 32;
+     constexpr int U = ATT_U;
+     const int QH = geo.qh, KVH = geo.kvh;
+@@ -699,6 +708,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge(Geo geo, cons
+                                                                      const float* __restrict__ PO, const Seg* __restrict__ segs,
+                                                                      const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc,
+                                                                      const int* __restrict__ P, __nv_bfloat16* __restrict__ OUT) {
++    tf_pdl_begin();
+     constexpr int DPL = HD / 32;
+     const int QH = geo.qh;
+     const int lane = threadIdx.x, qh = blockIdx.x;
+@@ -727,6 +737,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge(Geo geo, cons
+ // out = bf16(y * bf16(sigmoid(gate))), the gate the second half of each query head's q_proj rows; rows qh * HD wide.
+ extern "C" __global__ void tf_q35_attn_gate(Geo geo, const __nv_bfloat16* __restrict__ Y, const __nv_bfloat16* __restrict__ QRAW,
+                                               __nv_bfloat16* __restrict__ OUT, int rows, const int* __restrict__ P) {
++    tf_pdl_begin();
+     const size_t W = (size_t)geo.qh * HD;
+     if (P != nullptr) rows = P[2];
+     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+diff --git a/zig/kernels/cuda/qwen35_argmax.cuh b/zig/kernels/cuda/qwen35_argmax.cuh
+index 868ea18..48147a8 100644
+--- a/zig/kernels/cuda/qwen35_argmax.cuh
++++ b/zig/kernels/cuda/qwen35_argmax.cuh
+@@ -1,3 +1,4 @@
++#include "pdl.cuh"
+ // Greedy tokens, a block a slice then a warp a row: the highest logit (no NaN or -inf), ties to the lowest id.
+ constexpr int ARGMAX_SLICE = 4096;
+ 
+@@ -10,6 +11,7 @@ __device__ __forceinline__ void argmax_take(float v, int i, float& best, int& id
+ 
+ extern "C" __global__ void __launch_bounds__(256) tf_q35_argmax_slices(const __nv_bfloat16* __restrict__ L, int V, float* __restrict__ PV,
+                                                                         int* __restrict__ PI) {
++    tf_pdl_begin();
+     __shared__ float bv[8];
+     __shared__ int bi[8];
+     const int base = blockIdx.x * ARGMAX_SLICE;
+@@ -40,6 +42,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_argmax_slices(const __n
+ 
+ extern "C" __global__ void __launch_bounds__(32) tf_q35_argmax_merge(const float* __restrict__ PV, const int* __restrict__ PI, int slices,
+                                                                        unsigned* __restrict__ TOK) {
++    tf_pdl_begin();
+     float best = -INFINITY;
+     int id = 0x7fffffff;
+     for (int s = threadIdx.x; s < slices; s += 32) argmax_take(PV[blockIdx.x * slices + s], PI[blockIdx.x * slices + s], best, id);
+diff --git a/zig/kernels/cuda/qwen35_bf16.cu b/zig/kernels/cuda/qwen35_bf16.cu
+index 7ed5fa6..6d7157b 100644
+--- a/zig/kernels/cuda/qwen35_bf16.cu
++++ b/zig/kernels/cuda/qwen35_bf16.cu
+@@ -2,6 +2,7 @@
+ 
+ #include <cuda_bf16.h>
+ #include <stdint.h>
++#include "pdl.cuh"
+ 
+ // P (device counts, as qwen35.cu's): rows at or past P[2] are padding and left untouched; P may be null.
+ __device__ __forceinline__ bool q35b_past_rows(const int* P, int m) { return P != nullptr && m >= P[2]; }
+@@ -9,6 +10,7 @@ __device__ __forceinline__ bool q35b_past_rows(const int* P, int m) { return P !
+ // out[r] = table[ids[r]] (D wide, bit copy). Grid: rows; any D (16-byte vectors when D % 8 == 0 and the pointers align).
+ extern "C" __global__ void __launch_bounds__(256) tf_q35_embed_bf16(const int* __restrict__ ids, const __nv_bfloat16* __restrict__ table,
+                                                                      __nv_bfloat16* __restrict__ out, int D, const int* __restrict__ P) {
++    tf_pdl_begin();
+     if (q35b_past_rows(P, blockIdx.x)) return;
+     const size_t id = (size_t)ids[blockIdx.x];
+     const __nv_bfloat16* src = table + id * (size_t)D;
+@@ -25,6 +27,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_embed_bf16(const int* _
+ // then a fixed shuffle tree over the warp and the 8 warp sums in order. Nothing depends on the row count.
+ extern "C" __global__ void __launch_bounds__(256) tf_q35_dense_bf16(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
+                                                                      __nv_bfloat16* __restrict__ Y, int n, int k) {
++    tf_pdl_begin();
+     __shared__ float red[8];
+     const int j = blockIdx.x;
+     const size_t r = blockIdx.y;
+diff --git a/zig/kernels/cuda/qwen35_kv8.cu b/zig/kernels/cuda/qwen35_kv8.cu
+index dbf5d00..92c7b3a 100644
+--- a/zig/kernels/cuda/qwen35_kv8.cu
++++ b/zig/kernels/cuda/qwen35_kv8.cu
+@@ -1,6 +1,7 @@
+ // Ours: --kv-cache fp8 for Qwen3.5: key and value rows as e4m3, an fp32 scale (amax / 448) each, as qwen27 keeps them.
+ 
+ #include <cuda_fp8.h>
++#include "pdl.cuh"
+ 
+ #include "qwen35.cuh"
+ #include "qwen35_attn_prompt.cuh"
+@@ -48,6 +49,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_rope8(Geo geo, __nv_bfl
+                                                                  const __nv_bfloat16* __restrict__ Vr, const Seg* __restrict__ segs,
+                                                                  const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                                                  const int* __restrict__ P, const int* __restrict__ M) {
++    tf_pdl_begin();
+     __shared__ float red[HD / 32];
+     rope_rows(geo, Qn, Kn, Vr, segs, rowseg, rowanc, P, M, StoreFp8{layer, geo.kvh, red});
+ }
+@@ -68,6 +70,7 @@ extern "C" __global__ void tf_q35_attn_partial8(Geo geo, const __nv_bfloat16* __
+                                                   const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                                   const int* __restrict__ P, float scale,
+                                                   float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
++    tf_pdl_begin();
+     constexpr int DPL = HD / 32;
+     const int QH = geo.qh, KVH = geo.kvh;
+     const int lane = threadIdx.x & 31, g = threadIdx.x >> 5;
+@@ -130,6 +133,7 @@ extern "C" __global__ void __launch_bounds__(512, ATT_MB) tf_q35_attn_partial8_b
+                                                   const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                                   const int* __restrict__ P, float scale,
+                                                   float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
++    tf_pdl_begin();
+     constexpr int DPL = HD / 32;
+     constexpr int U = ATT_U;
+     constexpr int CPR = HD / 16;                                  // 16-byte chunks of an e4m3 row
+diff --git a/zig/kernels/cuda/qwen35_slots.cuh b/zig/kernels/cuda/qwen35_slots.cuh
+index a9df2fc..bbcc960 100644
+--- a/zig/kernels/cuda/qwen35_slots.cuh
++++ b/zig/kernels/cuda/qwen35_slots.cuh
+@@ -1,10 +1,12 @@
+ // Register-slot tree scan: the common CPU schedule preserves parent states and original output rows.
+ #pragma once
++#include "pdl.cuh"
+ struct SlotStep { unsigned row; int read_slot, write_slot; };
+ template <int SLOTS>
+ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const __nv_bfloat16* k,
+         const __nv_bfloat16* v, const float* g, const __nv_bfloat16* beta, const Seg* segs,
+         const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P) {
++    tf_pdl_begin();
+     const int NK = geo.nk, NV = geo.nv;
+     if (past_windows(P, blockIdx.z / NV)) return;
+     const int hv = blockIdx.z % NV, hk = hv / (NV / NK);
+diff --git a/zig/src/cuda/launch.zig b/zig/src/cuda/launch.zig
+index 3dfae8e..9988b9b 100644
+--- a/zig/src/cuda/launch.zig
++++ b/zig/src/cuda/launch.zig
+@@ -61,6 +61,37 @@ pub const Args = struct {
+     }
+ };
+ 
++/// Set while a graph is being captured: kernels that begin with kernels/cuda/pdl.cuh's tf_pdl_begin (the decode path's) launch
++/// with the programmatic-dependent-launch attribute, so each one's blocks come up while the one before finishes.
++pub var pdl_capture: bool = false;
++
++const pdl_kernels = [_][]const u8{
++    "tf_q35_norm", "tf_q35_gdn_pre", "tf_q35_conv_commit", "tf_q35_gdn_post", "tf_q35_head_norm", "tf_q35_rope", "tf_q35_attn_partial",
++    "tf_q35_attn_merge", "tf_q35_attn_gate", "tf_q35_embed_bf16", "tf_q35_dense_bf16", "tf_q35_argmax_slices", "tf_q35_argmax_merge",
++    "tf_q35_gdn_slots_", "tf_exl3_rotate_f", "tf_exl3_tc_", "tf_exl3_gd_", "tf_exl3_plan_rotate", "tf_exl3_plan_finish",
++    "tf_exl3_shared_plan", "tf_moe_router_rows", "tf_moe_topk", "tf_moe_combine", "_ZN10tf_experts11plan_kernel",
++};
++var pdl_seen: [512]struct { handle: ?*anyopaque = null, safe: bool = false } = @splat(.{});
++
++fn pdlSafe(f: Function) bool {
++    const key: ?*anyopaque = @ptrCast(f.handle);
++    var i: usize = @intCast((@intFromPtr(key) >> 4) % pdl_seen.len);
++    var n: usize = 0;
++    while (n < pdl_seen.len) : (n += 1) {
++        const e = &pdl_seen[i];
++        if (e.handle == key) return e.safe;
++        if (e.handle == null) {
++            const name = f.d.functionName(f.handle);
++            var safe = false;
++            for (pdl_kernels) |p| safe = safe or std.mem.startsWith(u8, name, p);
++            e.* = .{ .handle = key, .safe = safe };
++            return safe;
++        }
++        i = (i + 1) % pdl_seen.len;
++    }
++    return false;
++}
++
+ pub const Config = struct {
+     grid: Dim3,
+     block: Dim3,
+@@ -83,7 +114,9 @@ pub const Config = struct {
+ };
+ 
+ /// cuLaunchKernel for plain launches, cuLaunchKernelEx when a cluster, PDL or cooperative attribute is set.
+-pub fn launch(f: Function, cfg: Config, stream: Stream, args: *Args) Error!void {
++pub fn launch(f: Function, cfg_in: Config, stream: Stream, args: *Args) Error!void {
++    var cfg = cfg_in;
++    if (pdl_capture and !cfg.pdl and cfg.cluster == null and !cfg.cooperative and pdlSafe(f)) cfg.pdl = true;
+     try cfg.validate();
+     const d = f.d;
+     const g = cfg.grid;
+diff --git a/zig/src/families/qwen3_5/cuda_engine.zig b/zig/src/families/qwen3_5/cuda_engine.zig
+index 46d1d73..19edf13 100644
+--- a/zig/src/families/qwen3_5/cuda_engine.zig
++++ b/zig/src/families/qwen3_5/cuda_engine.zig
+@@ -574,6 +574,8 @@ pub const Engine = struct {
+                 errdefer _ = e.graphs.remove(shape.key());
+                 // captured, nothing runs: the replay below is this shape's first run
+                 try cuda.graph.beginCapture(e.stream, .thread_local);
++                cuda.launch.pdl_capture = Engine.pdl_on;
++                defer cuda.launch.pdl_capture = false;
+                 e.body(shape) catch |err| {
+                     var broken = cuda.graph.endCapture(e.stream) catch return err;
+                     broken.deinit();
+@@ -614,6 +616,9 @@ pub const Engine = struct {
+         }
+     }
+ 
++    /// TF_QWEN_PDL=0 launches the captured decode kernels without programmatic dependent launch.
++    pub var pdl_on: bool = true;
++
+     pub const Shape = @import("cuda_shapes.zig").Shape;
+ 
+     /// A prompt chunk's chain scan (tf_q35_gdn_prompt): the chain scan's launch over four value rows a warp.
+diff --git a/zig/src/families/qwen3_5/cuda_exl3_weights.zig b/zig/src/families/qwen3_5/cuda_exl3_weights.zig
+index 93b1c49..b7b3568 100644
+--- a/zig/src/families/qwen3_5/cuda_exl3_weights.zig
++++ b/zig/src/families/qwen3_5/cuda_exl3_weights.zig
+@@ -31,6 +31,7 @@ pub const Kit = struct {
+         errdefer gpa.destroy(k);
+         k.dense = try cuda.exl3.Dense.load(d);
+         if (std.c.getenv("TF_QWEN_FUSED_PROMPT")) |v| routed.setFusedPrompt(v[0] != '0');
++        if (std.c.getenv("TF_QWEN_PDL")) |v| engine.Engine.pdl_on = v[0] != '0';
+         if (std.c.getenv("TF_QWEN_SIDE_SHARED")) |v| routed.setSideShared(v[0] != '0');
+         if (std.c.getenv("TF_QWEN_DENSE_TILES") == null or std.c.getenv("TF_QWEN_DENSE_TILES").?[0] != '0') k.dense.implementation = .tiles; // bf16 x/y, even halves, stored layout: Ornith's dense weights all qualify
+         errdefer k.dense.unload();

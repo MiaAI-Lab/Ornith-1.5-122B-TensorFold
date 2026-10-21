@@ -1,0 +1,642 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mia <mia.ailab1@gmail.com>
+Date: Wed, 21 Oct 2026 02:10:37 +0300
+Subject: [PATCH] qwen35 tensor-core prompt attention and simple GDN prompt kernel
+
+---
+ zig/kernels/cuda/qwen35.cu                | 103 +++++++
+ zig/kernels/cuda/qwen35_attn_prompt.cuh   | 331 ++++++++++++++++++++++
+ zig/kernels/cuda/qwen35_kv8.cu            |   9 +
+ zig/src/families/qwen3_5/cuda_engine.zig  |  22 +-
+ zig/src/families/qwen3_5/cuda_forward.zig |  23 +-
+ zig/src/families/qwen3_5/cuda_layers.zig  |   4 +-
+ 6 files changed, 487 insertions(+), 5 deletions(-)
+ create mode 100644 zig/kernels/cuda/qwen35_attn_prompt.cuh
+
+diff --git a/zig/kernels/cuda/qwen35.cu b/zig/kernels/cuda/qwen35.cu
+index 103b766..0defb7e 100644
+--- a/zig/kernels/cuda/qwen35.cu
++++ b/zig/kernels/cuda/qwen35.cu
+@@ -1,6 +1,7 @@
+ // Qwen3.5's hybrids (2B, 27B) on CUDA: the Metal kernels' arithmetic and rounding; a segment is one stream's window.
+ 
+ #include "qwen35.cuh"
++#include "qwen35_attn_prompt.cuh"
+ 
+ using namespace tf_q35;
+ 
+@@ -337,6 +338,100 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_chain(Geo geo, cons
+     for (int i = 0; i < PT; i++) st[i] = state[i];
+ }
+ 
++// Prompt chains (rows > 16): tf_q35_gdn_chain's gated delta rule with a warp over 4 value rows (GDN_DV) of a head, so a
++// row's k and q are loaded once for the four, and the four rows' reductions run side by side. The decayed state's
++// reductions with k (the memory read) and q run together, and the output is the decayed state . q plus delta * (k . q),
++// the updated state . q without waiting for the update. Grid (1, DK / (4 * GDN_DV), nv * segments), block (32, 4); a
++// chain only, and P[4] == 0 (nothing logged).
++constexpr int GDN_DV = 4;
++extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_prompt(Geo geo, const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
++                                                                      const __nv_bfloat16* __restrict__ v, const float* __restrict__ g,
++                                                                      const __nv_bfloat16* __restrict__ beta, const Seg* __restrict__ segs,
++                                                                      const int* __restrict__ rowpar, int layer, __nv_bfloat16* __restrict__ y,
++                                                                      const int* __restrict__ P) {
++    const int NK = geo.nk, NV = geo.nv;
++    if (past_windows(P, blockIdx.z / NV)) return;
++    const int hv = blockIdx.z % NV;
++    const int hk = hv / (NV / NK);
++    const Seg sg = segs[blockIdx.z / NV];
++    const int dk = threadIdx.x;
++    const int dv0 = (blockIdx.y * 4 + threadIdx.y) * GDN_DV;
++    constexpr int PT = DK / 32;
++    float* st = reinterpret_cast<float*>(sg.rec) + (size_t)layer * geo.rec() + ((size_t)hv * DK + dv0) * DK + PT * dk;
++    float state[GDN_DV][PT];
++#pragma unroll
++    for (int j = 0; j < GDN_DV; j++)
++#pragma unroll
++        for (int i = 0; i < PT; i++) state[j][i] = st[(size_t)j * DK + i];
++    float kn[PT], qn[PT], vn[GDN_DV], gn = 0.0f, bn = 0.0f, kqn = 0.0f;
++    auto load = [&](int row) {
++        const uint2 kw = *reinterpret_cast<const uint2*>(k + ((size_t)row * NK + hk) * DK + PT * dk);
++        const uint2 qw = *reinterpret_cast<const uint2*>(q + ((size_t)row * NK + hk) * DK + PT * dk);
++        const __nv_bfloat16* kb = reinterpret_cast<const __nv_bfloat16*>(&kw);
++        const __nv_bfloat16* qb = reinterpret_cast<const __nv_bfloat16*>(&qw);
++        float kq = 0.0f;
++#pragma unroll
++        for (int i = 0; i < PT; i++) {
++            kn[i] = bf(kb[i]);
++            qn[i] = bf(qb[i]);
++            kq = fmaf(kn[i], qn[i], kq);
++        }
++        kqn = warp_sum(kq);
++        const uint2 vw = *reinterpret_cast<const uint2*>(v + ((size_t)row * NV + hv) * DK + dv0);
++        const __nv_bfloat16* vb = reinterpret_cast<const __nv_bfloat16*>(&vw);
++#pragma unroll
++        for (int j = 0; j < GDN_DV; j++) vn[j] = bf(vb[j]);
++        gn = g[row * NV + hv];
++        bn = bf(beta[row * NV + hv]);
++    };
++    if (sg.rows > 0) load(sg.row0);
++    for (int r = 0; r < sg.rows; r++) {
++        const int row = sg.row0 + r;
++        float kc[PT], qc[PT], vc[GDN_DV];
++#pragma unroll
++        for (int i = 0; i < PT; i++) {
++            kc[i] = kn[i];
++            qc[i] = qn[i];
++        }
++#pragma unroll
++        for (int j = 0; j < GDN_DV; j++) vc[j] = vn[j];
++        const float gc = gn, bc = bn, kqc = kqn;
++        if (r + 1 < sg.rows) load(row + 1);
++        float kv[GDN_DV], qs[GDN_DV];
++#pragma unroll
++        for (int j = 0; j < GDN_DV; j++) {
++            kv[j] = 0.0f;
++            qs[j] = 0.0f;
++#pragma unroll
++            for (int i = 0; i < PT; i++) {
++                state[j][i] = state[j][i] * gc;
++                kv[j] = fmaf(state[j][i], kc[i], kv[j]);
++                qs[j] = fmaf(state[j][i], qc[i], qs[j]);
++            }
++        }
++#pragma unroll
++        for (int m = 16; m; m >>= 1)
++#pragma unroll
++            for (int j = 0; j < GDN_DV; j++) {
++                kv[j] += __shfl_xor_sync(0xffffffffu, kv[j], m);
++                qs[j] += __shfl_xor_sync(0xffffffffu, qs[j], m);
++            }
++        __nv_bfloat16 ob[GDN_DV];
++#pragma unroll
++        for (int j = 0; j < GDN_DV; j++) {
++            const float delta = (vc[j] - kv[j]) * bc;
++#pragma unroll
++            for (int i = 0; i < PT; i++) state[j][i] = fmaf(kc[i], delta, state[j][i]);
++            ob[j] = __float2bfloat16_rn(fmaf(delta, kqc, qs[j]));
++        }
++        if (dk == 0) *reinterpret_cast<uint2*>(y + ((size_t)row * NV + hv) * DK + dv0) = *reinterpret_cast<const uint2*>(ob);
++    }
++#pragma unroll
++    for (int j = 0; j < GDN_DV; j++)
++#pragma unroll
++        for (int i = 0; i < PT; i++) st[(size_t)j * DK + i] = state[j][i];
++}
++
+ // out = bf16(silu(z) * bf16(w * rmsnorm(y))) per linear value head; rows nv * DK wide. Grid (1, nv, rows), a warp each.
+ extern "C" __global__ void __launch_bounds__(32) tf_q35_gdn_post(Geo geo, const __nv_bfloat16* __restrict__ Y, const __nv_bfloat16* __restrict__ Z,
+                                                                    const __nv_bfloat16* __restrict__ NW, float eps, __nv_bfloat16* __restrict__ OUT,
+@@ -468,6 +563,14 @@ extern "C" __global__ void tf_q35_attn_partial(Geo geo, const __nv_bfloat16* __r
+     for (int i = 0; i < DPL; i++) PO[slot * HD + lane * DPL + i] = o[i];
+ }
+ 
++// Prompt-chunk attention on tensor cores (qwen35_attn_prompt.cuh): one pass over the keys, the final bf16 rows, no partials.
++extern "C" __global__ void __launch_bounds__(PW * 32, 2) tf_q35_attn_prompt(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
++                                                                             const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
++                                                                             const int* __restrict__ P, float scale, __nv_bfloat16* __restrict__ Y) {
++    __shared__ __align__(16) unsigned char smem[2 * PKT * HD * 2];
++    attn_prompt_body<false>(geo, Q, segs, rowseg, rowanc, layer, P, scale, Y, smem);
++}
++
+ // A row's chunks' partials into each (row, query head)'s output, rows qh * HD wide. Grid (qh, rows), a warp each.
+ extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge(Geo geo, const float* __restrict__ PM, const float* __restrict__ PL,
+                                                                      const float* __restrict__ PO, const Seg* __restrict__ segs,
+diff --git a/zig/kernels/cuda/qwen35_attn_prompt.cuh b/zig/kernels/cuda/qwen35_attn_prompt.cuh
+new file mode 100644
+index 0000000..203dc13
+--- /dev/null
++++ b/zig/kernels/cuda/qwen35_attn_prompt.cuh
+@@ -0,0 +1,331 @@
++// Ours: Qwen3.5's prompt-chunk attention on tensor cores (mma.sync m16n8k16 bf16, fp32 accumulate), flash-style:
++// one pass over the keys with an online softmax, no partials. A prompt chunk is one stream's chain of rows (row r sees
++// the cache's len keys and the chunk's rows 0..r), so a row's keys are the contiguous cache slots 0 .. keys - 1.
++//
++// A warp is one row: its 16 query heads of one key/value head are the mma's 16 rows (GQA group 16). A block is PW
++// consecutive rows of one key/value head; they share each tile of PKT keys staged in shared memory. The queries stay in
++// registers as A fragments, the scores S = Q K^T and the output O += P V are m16n8k16 mmas (P re-packed from the score
++// fragments), and the row's causal mask is applied on the tiles past its own key count.
++//
++// The e4m3 cache variant widens a tile's key and value codes to bf16 exactly (every e4m3 value is a bf16), takes the
++// score on the codes and scales it by the key's fp32 scale, and scales a value's weight by the value's scale before it
++// is rounded to bf16, as tf_q35_attn_partial8 does in fp32.
++
++#pragma once
++#include <cuda_fp8.h>
++
++#include "qwen35.cuh"
++
++namespace tf_q35 {
++
++constexpr int PW = 4;    // rows (warps) a block
++constexpr int PKT = 32;  // keys a tile
++constexpr int PG = 16;   // query heads a key/value head: the mma's rows
++
++__device__ __forceinline__ uint32_t sm32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
++__device__ __forceinline__ void cp16(uint32_t dst, const void* src) {
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
++}
++__device__ __forceinline__ void cp4(uint32_t dst, const void* src) {
++    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(dst), "l"(src));
++}
++__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
++__device__ __forceinline__ void cp_wait0() { asm volatile("cp.async.wait_group 0;\n" ::); }
++__device__ __forceinline__ void ldsm4(uint32_t (&r)[4], uint32_t addr) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
++}
++__device__ __forceinline__ void ldsm4t(uint32_t (&r)[4], uint32_t addr) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
++}
++__device__ __forceinline__ void mma16816(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++__device__ __forceinline__ float ex2(float x) {
++    float y;
++    asm("ex2.approx.ftz.f32 %0, %1;\n" : "=f"(y) : "f"(x));
++    return y;
++}
++__device__ __forceinline__ uint32_t pack2(float lo, float hi) {
++    __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
++    return *reinterpret_cast<uint32_t*>(&v);
++}
++// A 512-byte tile row (256 bf16) as 32 16-byte chunks, the chunk index xor the row's low bits: ldmatrix reads of 8 rows
++// at one logical chunk land in 8 different bank groups.
++__device__ __forceinline__ uint32_t swz(int row, int chunk) { return (uint32_t)(row * 512 + ((chunk ^ (row & 7)) << 4)); }
++
++// Four e4m3 codes in a word as two bf16 pairs.
++__device__ __forceinline__ void widen4(uint32_t w, uint32_t& lo, uint32_t& hi) {
++    const __half2 a = __half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(w & 0xffffu), __NV_E4M3));
++    const __half2 b = __half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(w >> 16), __NV_E4M3));
++    const float2 fa = __half22float2(a), fb = __half22float2(b);
++    lo = pack2(fa.x, fa.y);
++    hi = pack2(fb.x, fb.y);
++}
++
++// Bytes of dynamic shared memory the e4m3 variant needs: raw key and value tiles, their widened tiles, the scales.
++constexpr int PROMPT_SMEM8 = 2 * PKT * HD + 2 * PKT * HD * 2 + 4 * PKT * 4;
++
++// Y (rows, qh, HD) bf16 for the chunk's rows; grid (row tiles, kv heads), PW * 32 threads. FP8: the cache holds e4m3.
++template <bool FP8>
++__device__ __forceinline__ void attn_prompt_body(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
++                                                 const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
++                                                 const int* __restrict__ P, float scale, __nv_bfloat16* __restrict__ Y, unsigned char* smem) {
++    const int QH = geo.qh, KVH = geo.kvh;
++    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t4 = lane & 3;
++    const int h = blockIdx.y;
++    const int total = P != nullptr ? P[2] : (int)gridDim.x * PW;
++    const int m0 = ((int)gridDim.x - 1 - (int)blockIdx.x) * PW;  // the longest rows first
++    if (m0 >= total) return;
++    const int m = m0 + w;
++    const bool live = m < total;
++    const int mlast = min(m0 + PW, total) - 1;
++    const Seg sg = segs[rowseg[m0]];
++    const int keys_w = live ? sg.len + rows_seen(rowanc[m]) : 0;
++    const int keys_blk = sg.len + rows_seen(rowanc[mlast]);
++    const int nt = (keys_blk + PKT - 1) / PKT;
++    const size_t cap = sg.cap;
++
++    // smem: [Ks][Vs] widened tiles (bf16, swizzled), then for e4m3 the raw tiles and scales
++    unsigned char* Ks = smem;
++    unsigned char* Vs = smem + PKT * HD * 2;
++    const uint32_t Ks32 = sm32(Ks), Vs32 = sm32(Vs);
++    unsigned char* Kr = smem + 2 * PKT * HD * 2;
++    unsigned char* Vr = Kr + PKT * HD;
++    float* skr = reinterpret_cast<float*>(Vr + PKT * HD);
++    float* svr = skr + PKT;
++    float* sk = svr + PKT;
++    float* sv = sk + PKT;
++
++    const unsigned char* Kg;
++    const unsigned char* Vg;
++    const float* KS = nullptr;
++    const float* VS = nullptr;
++    if (FP8) {
++        Kg = reinterpret_cast<unsigned char*>(sg.kv) + (size_t)layer * 2 * KVH * cap * (HD + 4);
++        Vg = Kg + (size_t)KVH * cap * HD;
++        KS = reinterpret_cast<const float*>(Vg + (size_t)KVH * cap * HD);
++        VS = KS + (size_t)KVH * cap;
++    } else {
++        Kg = reinterpret_cast<unsigned char*>(sg.kv) + (size_t)layer * 2 * KVH * cap * HD * 2;
++        Vg = Kg + (size_t)KVH * cap * HD * 2;
++    }
++    const size_t hrow = (size_t)h * cap;
++
++    // the 16 heads' queries as A fragments: row g and g + 8, columns 2 t4 and 2 t4 + 8 of each 16
++    uint32_t qa[16][4];
++    {
++        const __nv_bfloat16* qp = Q + ((size_t)(live ? m : m0) * QH + (size_t)h * PG) * HD + 2 * t4;
++#pragma unroll
++        for (int s = 0; s < 16; s++) {
++            qa[s][0] = *reinterpret_cast<const uint32_t*>(qp + (size_t)g * HD + 16 * s);
++            qa[s][1] = *reinterpret_cast<const uint32_t*>(qp + (size_t)(g + 8) * HD + 16 * s);
++            qa[s][2] = *reinterpret_cast<const uint32_t*>(qp + (size_t)g * HD + 16 * s + 8);
++            qa[s][3] = *reinterpret_cast<const uint32_t*>(qp + (size_t)(g + 8) * HD + 16 * s + 8);
++        }
++    }
++
++    float o[32][4];
++#pragma unroll
++    for (int n = 0; n < 32; n++) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
++    float mr0 = -INFINITY, mr1 = -INFINITY, ls0 = 0.0f, ls1 = 0.0f;
++    const float sl = scale * 1.4426950408889634f;
++
++    // issue a tile's loads: bf16 tiles straight to their swizzled slots; e4m3 tiles and scales to the raw staging
++    auto issue_k = [&](int t) {
++        if (FP8) {
++#pragma unroll
++            for (int i = 0; i < 4; i++) {
++                const int c = tid + 128 * i, key = c >> 4, ch = c & 15;
++                const int pos = min(t * PKT + key, keys_blk - 1);
++                cp16(sm32(Kr) + key * HD + ch * 16, Kg + (hrow + pos) * HD + ch * 16);
++            }
++            if (tid < PKT) cp4(sm32(skr) + tid * 4, KS + hrow + min(t * PKT + tid, keys_blk - 1));
++        } else {
++#pragma unroll
++            for (int i = 0; i < 8; i++) {
++                const int c = tid + 128 * i, key = c >> 5, ch = c & 31;
++                const int pos = min(t * PKT + key, keys_blk - 1);
++                cp16(Ks32 + swz(key, ch), Kg + (hrow + pos) * HD * 2 + ch * 16);
++            }
++        }
++    };
++    auto issue_v = [&](int t) {
++        if (FP8) {
++#pragma unroll
++            for (int i = 0; i < 4; i++) {
++                const int c = tid + 128 * i, key = c >> 4, ch = c & 15;
++                const int pos = min(t * PKT + key, keys_blk - 1);
++                cp16(sm32(Vr) + key * HD + ch * 16, Vg + (hrow + pos) * HD + ch * 16);
++            }
++            if (tid < PKT) cp4(sm32(svr) + tid * 4, VS + hrow + min(t * PKT + tid, keys_blk - 1));
++        } else {
++#pragma unroll
++            for (int i = 0; i < 8; i++) {
++                const int c = tid + 128 * i, key = c >> 5, ch = c & 31;
++                const int pos = min(t * PKT + key, keys_blk - 1);
++                cp16(Vs32 + swz(key, ch), Vg + (hrow + pos) * HD * 2 + ch * 16);
++            }
++        }
++    };
++    // e4m3: widen the staged tiles into Ks and Vs (and copy the scales out of the staging)
++    auto widen_tiles = [&]() {
++#pragma unroll
++        for (int i = 0; i < 4; i++) {
++            const int c = tid + 128 * i, key = c >> 4, ch = c & 15;
++            {
++                const uint4 r = *reinterpret_cast<const uint4*>(Kr + key * HD + ch * 16);
++                uint4 a, b;
++                widen4(r.x, a.x, a.y);
++                widen4(r.y, a.z, a.w);
++                widen4(r.z, b.x, b.y);
++                widen4(r.w, b.z, b.w);
++                *reinterpret_cast<uint4*>(Ks + swz(key, 2 * ch)) = a;
++                *reinterpret_cast<uint4*>(Ks + swz(key, 2 * ch + 1)) = b;
++            }
++            {
++                const uint4 r = *reinterpret_cast<const uint4*>(Vr + key * HD + ch * 16);
++                uint4 a, b;
++                widen4(r.x, a.x, a.y);
++                widen4(r.y, a.z, a.w);
++                widen4(r.z, b.x, b.y);
++                widen4(r.w, b.z, b.w);
++                *reinterpret_cast<uint4*>(Vs + swz(key, 2 * ch)) = a;
++                *reinterpret_cast<uint4*>(Vs + swz(key, 2 * ch + 1)) = b;
++            }
++        }
++        if (tid < PKT) sk[tid] = skr[tid];
++        else if (tid < 2 * PKT) sv[tid - PKT] = svr[tid - PKT];
++    };
++
++    if (nt > 0) {
++        issue_k(0);
++        if (FP8) issue_v(0);
++        cp_commit();
++    }
++    for (int t = 0; t < nt; t++) {
++        const bool act = keys_w > t * PKT;
++        float sacc[4][4];
++#pragma unroll
++        for (int j = 0; j < 4; j++) sacc[j][0] = sacc[j][1] = sacc[j][2] = sacc[j][3] = 0.0f;
++        if (FP8) {
++            cp_wait0();
++            __syncthreads();  // staged tiles landed; the previous tile's mmas are done with Ks and Vs
++            widen_tiles();
++            __syncthreads();  // widened; the staging is free
++            if (t + 1 < nt) {
++                issue_k(t + 1);
++                issue_v(t + 1);
++                cp_commit();
++            }
++        } else {
++            cp_wait0();
++            __syncthreads();  // K(t) landed; every warp is through P V of t - 1, so Vs is free
++            issue_v(t);
++            cp_commit();
++        }
++        if (act) {
++#pragma unroll
++            for (int p = 0; p < 8; p++) {
++                uint32_t b[4][4];
++#pragma unroll
++                for (int j = 0; j < 4; j++) ldsm4(b[j], Ks32 + swz(8 * j + (lane & 7), 4 * p + (lane >> 3)));
++#pragma unroll
++                for (int j = 0; j < 4; j++) {
++                    mma16816(sacc[j], qa[2 * p], b[j][0], b[j][1]);
++                    mma16816(sacc[j], qa[2 * p + 1], b[j][2], b[j][3]);
++                }
++            }
++        }
++        if (!FP8) {
++            cp_wait0();
++            __syncthreads();  // V(t) landed; every warp is through Q K^T of t, so Ks is free
++            if (t + 1 < nt) {
++                issue_k(t + 1);
++                cp_commit();
++            }
++        }
++        if (act) {
++            // scores, masked past the row's keys, and the tile's new row maxima (a quad holds a row)
++            float mx0 = -INFINITY, mx1 = -INFINITY;
++#pragma unroll
++            for (int j = 0; j < 4; j++) {
++#pragma unroll
++                for (int e = 0; e < 4; e++) {
++                    const int kk = 8 * j + 2 * t4 + (e & 1);
++                    float v = sacc[j][e] * sl;
++                    if (FP8) v *= sk[kk];
++                    if (t * PKT + kk >= keys_w) v = -INFINITY;
++                    sacc[j][e] = v;
++                    if (e < 2) mx0 = fmaxf(mx0, v);
++                    else mx1 = fmaxf(mx1, v);
++                }
++            }
++            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
++            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
++            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
++            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
++            const float mn0 = fmaxf(mr0, mx0), mn1 = fmaxf(mr1, mx1);
++            const float a0 = ex2(mr0 - mn0), a1 = ex2(mr1 - mn1);
++            mr0 = mn0;
++            mr1 = mn1;
++            float s0 = 0.0f, s1 = 0.0f;
++#pragma unroll
++            for (int j = 0; j < 4; j++) {
++                sacc[j][0] = ex2(sacc[j][0] - mn0);
++                sacc[j][1] = ex2(sacc[j][1] - mn0);
++                sacc[j][2] = ex2(sacc[j][2] - mn1);
++                sacc[j][3] = ex2(sacc[j][3] - mn1);
++                s0 += sacc[j][0] + sacc[j][1];
++                s1 += sacc[j][2] + sacc[j][3];
++            }
++            ls0 = ls0 * a0 + s0;
++            ls1 = ls1 * a1 + s1;
++#pragma unroll
++            for (int n = 0; n < 32; n++) {
++                o[n][0] *= a0;
++                o[n][1] *= a0;
++                o[n][2] *= a1;
++                o[n][3] *= a1;
++            }
++            // O += P V, P re-packed from the score fragments as A fragments over 16 keys each
++#pragma unroll
++            for (int ks = 0; ks < 2; ks++) {
++                float v0 = 1.0f, v1 = 1.0f, v2 = 1.0f, v3 = 1.0f;
++                if (FP8) {
++                    v0 = sv[16 * ks + 2 * t4];
++                    v1 = sv[16 * ks + 2 * t4 + 1];
++                    v2 = sv[16 * ks + 8 + 2 * t4];
++                    v3 = sv[16 * ks + 8 + 2 * t4 + 1];
++                }
++                uint32_t pa[4];
++                pa[0] = pack2(sacc[2 * ks][0] * v0, sacc[2 * ks][1] * v1);
++                pa[1] = pack2(sacc[2 * ks][2] * v0, sacc[2 * ks][3] * v1);
++                pa[2] = pack2(sacc[2 * ks + 1][0] * v2, sacc[2 * ks + 1][1] * v3);
++                pa[3] = pack2(sacc[2 * ks + 1][2] * v2, sacc[2 * ks + 1][3] * v3);
++#pragma unroll
++                for (int nn = 0; nn < 16; nn++) {
++                    uint32_t b[4];
++                    ldsm4t(b, Vs32 + swz(16 * ks + ((lane >> 3) & 1) * 8 + (lane & 7), 2 * nn + (lane >> 4)));
++                    mma16816(o[2 * nn], pa, b[0], b[1]);
++                    mma16816(o[2 * nn + 1], pa, b[2], b[3]);
++                }
++            }
++        }
++    }
++    if (!live) return;
++    ls0 += __shfl_xor_sync(0xffffffffu, ls0, 1);
++    ls0 += __shfl_xor_sync(0xffffffffu, ls0, 2);
++    ls1 += __shfl_xor_sync(0xffffffffu, ls1, 1);
++    ls1 += __shfl_xor_sync(0xffffffffu, ls1, 2);
++    const float r0 = 1.0f / ls0, r1 = 1.0f / ls1;
++    __nv_bfloat16* yp = Y + ((size_t)m * QH + (size_t)h * PG) * HD + 2 * t4;
++#pragma unroll
++    for (int n = 0; n < 32; n++) {
++        *reinterpret_cast<uint32_t*>(yp + (size_t)g * HD + 8 * n) = pack2(o[n][0] * r0, o[n][1] * r0);
++        *reinterpret_cast<uint32_t*>(yp + (size_t)(g + 8) * HD + 8 * n) = pack2(o[n][2] * r1, o[n][3] * r1);
++    }
++}
++
++}  // namespace tf_q35
+diff --git a/zig/kernels/cuda/qwen35_kv8.cu b/zig/kernels/cuda/qwen35_kv8.cu
+index ed7ccdf..ce0a712 100644
+--- a/zig/kernels/cuda/qwen35_kv8.cu
++++ b/zig/kernels/cuda/qwen35_kv8.cu
+@@ -3,6 +3,7 @@
+ #include <cuda_fp8.h>
+ 
+ #include "qwen35.cuh"
++#include "qwen35_attn_prompt.cuh"
+ 
+ using namespace tf_q35;
+ 
+@@ -123,6 +124,14 @@ extern "C" __global__ void tf_q35_attn_partial8(Geo geo, const __nv_bfloat16* __
+     for (int i = 0; i < DPL; i++) PO[slot * HD + lane * DPL + i] = o[i];
+ }
+ 
++// tf_q35_attn_prompt over e4m3 rows; dynamic shared memory of PROMPT_SMEM8 bytes.
++extern "C" __global__ void __launch_bounds__(PW * 32, 2) tf_q35_attn_prompt8(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
++                                                                              const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
++                                                                              const int* __restrict__ P, float scale, __nv_bfloat16* __restrict__ Y) {
++    extern __shared__ __align__(16) unsigned char smem[];
++    attn_prompt_body<true>(geo, Q, segs, rowseg, rowanc, layer, P, scale, Y, smem);
++}
++
+ // tf_q35k_compact over e4m3 rows: the path's keys, values and their scales move down to the slots after the cache.
+ extern "C" __global__ void __launch_bounds__(256) tf_q35k_compact8(Geo geo, Seg sg, Path path) {
+     const int KVH = geo.kvh;
+diff --git a/zig/src/families/qwen3_5/cuda_engine.zig b/zig/src/families/qwen3_5/cuda_engine.zig
+index 7e34c1a..bb578c9 100644
+--- a/zig/src/families/qwen3_5/cuda_engine.zig
++++ b/zig/src/families/qwen3_5/cuda_engine.zig
+@@ -21,6 +21,8 @@ const head_dim = geometry.head_dim;
+ 
+ /// Rows of one forward at most: a prompt chunk, or a shared round's windows.
+ pub const max_rows = 2048;
++/// tf_q35_attn_prompt8's dynamic shared memory (qwen35_attn_prompt.cuh's PROMPT_SMEM8).
++pub const prompt_smem8: u32 = 2 * 32 * 256 + 2 * 32 * 256 * 2 + 4 * 32 * 4;
+ /// Streams' windows in one forward at most.
+ pub const max_segs = Round.max_segs;
+ /// Rows of a verify forward at most: each row's logits are kept and drawn.
+@@ -81,6 +83,8 @@ pub const Engine = struct {
+     geo: Geo,
+     stream: cuda.Stream,
+     mods: [16]cuda.Module,
++    old_gdn: bool = false, // TF_QWEN_OLD_GDN: prompt chunks take the one-row-a-warp gated delta scan
++    old_attn: bool = false, // TF_QWEN_OLD_ATTN: prompt chunks take the scalar partial/merge attention
+     kv8: bool, // attention caches as e4m3 rows with a scale each
+     fp8: Kv8,
+     draws: cuda.sample.Draws,
+@@ -222,7 +226,10 @@ pub const Engine = struct {
+         e.moe.fast_rows = std.c.getenv("TF_QWEN_ROUTER_TILE") == null;
+         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
+         inline for (@typeInfo(Keeps).@"struct".field_names) |name| @field(e.keeps, name) = try e.mods[6].function("tf_q35k_" ++ name);
+-        e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .compact = try e.mods[9].function("tf_q35k_compact8") };
++        e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .attn_prompt = try e.mods[9].function("tf_q35_attn_prompt8"), .compact = try e.mods[9].function("tf_q35k_compact8") };
++        try e.fp8.attn_prompt.allowDynamicShared(prompt_smem8);
++        e.old_attn = std.c.getenv("TF_QWEN_OLD_ATTN") != null;
++        e.old_gdn = std.c.getenv("TF_QWEN_OLD_GDN") != null;
+         e.layers = try gpa.alloc(Layer, g.layers);
+         errdefer gpa.free(e.layers);
+         if (g.exl3) {
+@@ -343,6 +350,14 @@ pub const Engine = struct {
+         return total;
+     }
+ 
++    /// `run` with dynamic shared memory.
++    pub fn runShared(e: *Engine, f: cuda.Function, grid: [3]usize, block: [3]usize, shared: u32, args: anytype) !void {
++        var a: cuda.Args = .{};
++        inline for (args) |v| a.add(v);
++        const cfg: cuda.Config = .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = @intCast(block[0]), .y = @intCast(block[1]), .z = @intCast(block[2]) }, .shared = shared };
++        try cuda.launch.launch(f, cfg, e.stream, &a);
++    }
++
+     pub fn run(e: *Engine, f: cuda.Function, grid: [3]usize, block: [3]usize, args: anytype) !void {
+         var a: cuda.Args = .{};
+         inline for (args) |v| a.add(v);
+@@ -552,6 +567,11 @@ pub const Engine = struct {
+ 
+     pub const Shape = @import("cuda_shapes.zig").Shape;
+ 
++    /// A prompt chunk's chain scan (tf_q35_gdn_prompt): the chain scan's launch over four value rows a warp.
++    pub fn promptScan(e: *Engine, segments: usize, layer: c_int) !void {
++        try e.run(e.fns.gdn_prompt, .{ 1, geometry.dk / 16, e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, e.tables.ptr + rowpar_at, layer, e.y, e.tables.ptr + params_at });
++    }
++
+     /// The same scan selected by body, exposed for host launch-contract fixtures.
+     pub fn deltaScan(e: *Engine, record: bool, slot_count: u8, segments: usize, layer: c_int) !void {
+         const scan = if (!record) e.fns.gdn_chain else switch (slot_count) {
+diff --git a/zig/src/families/qwen3_5/cuda_forward.zig b/zig/src/families/qwen3_5/cuda_forward.zig
+index ddc6eca..ae7cf0b 100644
+--- a/zig/src/families/qwen3_5/cuda_forward.zig
++++ b/zig/src/families/qwen3_5/cuda_forward.zig
+@@ -15,6 +15,15 @@ const params_at = E.Engine.params_at;
+ const mpos_at = E.Engine.mpos_at;
+ const src_at = E.Engine.src_at;
+ 
++/// Rows (warps) a block of tf_q35_attn_prompt covers (qwen35_attn_prompt.cuh's PW).
++const attn_prompt_rows = 4;
++
++/// Whether this forward's attention takes the tensor-core prompt kernel: a prompt chunk of one stream past the 16-row
++/// boundary, 16 query heads to a key/value head of the 256 width.
++fn promptAttn(e: *E.Engine, prompt: bool, total: usize, nseg: usize) bool {
++    return prompt and total > prompt_moe_cutoff and nseg == 1 and !e.old_attn and e.g.q_heads == 16 * e.g.kv_heads and head_dim == 256;
++}
++
+ pub fn promptMoe(prompt: bool, rows: usize) bool {
+     return prompt and rows > prompt_moe_cutoff;
+ }
+@@ -54,7 +63,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
+                 if (e.learning) |k| try k.delta(i, e.qkv, e.z, e.b, e.a, total);
+                 try e.run(e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
+                 try e.run(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
+-                try e.deltaScan(record, shape.slots, nseg, layer);
++                if (prompt and total > prompt_moe_cutoff and !e.old_gdn) try e.promptScan(nseg, layer) else try e.deltaScan(record, shape.slots, nseg, layer);
+                 try e.run(e.fns.gdn_post, .{ 1, g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params });
+                 try e.proj(m.out, e.mix, e.r, total, prompt);
+                 di += 1;
+@@ -68,8 +77,16 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
+                 try e.run(e.fns.head_norm, .{ total * g.q_heads, 1, 1 }, .{ 64, 1, 1 }, .{ e.qraw, m.q_norm, e.qn, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), g.eps, t_params });
+                 try e.run(e.fns.head_norm, .{ total * g.kv_heads, 1, 1 }, .{ 64, 1, 1 }, .{ e.kraw, m.k_norm, e.kn, @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(g.kv_heads * head_dim)), @as(c_int, head_dim), g.eps, t_params });
+                 try e.run(if (e.kv8) e.fp8.rope else e.fns.rope, .{ total, 1, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qn, e.kn, e.vraw, t_segs, t_rows, t_anc, ai, t_params, mpos });
+-                try e.run(if (e.kv8) e.fp8.attn_partial else e.fns.attn_partial, .{ max_chunks, g.kv_heads, total }, .{ 32 * group, 1, 1 }, .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po });
+-                try e.run(e.fns.attn_merge, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.y });
++                // a prompt chunk (one stream's chain of rows) takes the tensor-core kernel; windows and short pieces keep the
++                // scalar kernels whose chunking matches a one-row step's
++                if (promptAttn(e, prompt, total, nseg)) {
++                    const grid = [3]usize{ (total + attn_prompt_rows - 1) / attn_prompt_rows, g.kv_heads, 1 };
++                    const args = .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), e.y };
++                    if (e.kv8) try e.runShared(e.fp8.attn_prompt, grid, .{ attn_prompt_rows * 32, 1, 1 }, E.prompt_smem8, args) else try e.run(e.fns.attn_prompt, grid, .{ attn_prompt_rows * 32, 1, 1 }, args);
++                } else {
++                    try e.run(if (e.kv8) e.fp8.attn_partial else e.fns.attn_partial, .{ max_chunks, g.kv_heads, total }, .{ 32 * group, 1, 1 }, .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po });
++                    try e.run(e.fns.attn_merge, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.y });
++                }
+                 try e.run(e.fns.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params });
+                 if (e.learning) |k| try k.gated(i, e.mix, total);
+                 try e.proj(m.o, e.mix, e.r, total, prompt);
+diff --git a/zig/src/families/qwen3_5/cuda_layers.zig b/zig/src/families/qwen3_5/cuda_layers.zig
+index 0e7d24b..9cdb467 100644
+--- a/zig/src/families/qwen3_5/cuda_layers.zig
++++ b/zig/src/families/qwen3_5/cuda_layers.zig
+@@ -48,6 +48,7 @@ pub const Fns = struct {
+     gdn_pre: cuda.Function,
+     conv_commit: cuda.Function,
+     gdn_chain: cuda.Function,
++    gdn_prompt: cuda.Function, // prompt chains past 16 rows: four value rows a warp, the output without waiting for the update
+     gdn_slots_1: cuda.Function,
+     gdn_slots_2: cuda.Function,
+     gdn_slots_4: cuda.Function,
+@@ -57,6 +58,7 @@ pub const Fns = struct {
+     head_norm: cuda.Function,
+     rope: cuda.Function,
+     attn_partial: cuda.Function,
++    attn_prompt: cuda.Function, // tensor-core prompt-chunk attention (rows > 16), the final rows with no partials
+     attn_merge: cuda.Function,
+     attn_gate: cuda.Function,
+     mlp_act: cuda.Function,
+@@ -71,4 +73,4 @@ pub const Fns = struct {
+ pub const Keeps = struct { apply: cuda.Function, conv: cuda.Function, compact: cuda.Function };
+ 
+ /// qwen35_kv8.cu's kernels: the cache writes, attention reads and keep's moves over e4m3 rows (--kv-cache fp8).
+-pub const Kv8 = struct { rope: cuda.Function, attn_partial: cuda.Function, compact: cuda.Function };
++pub const Kv8 = struct { rope: cuda.Function, attn_partial: cuda.Function, attn_prompt: cuda.Function, compact: cuda.Function };

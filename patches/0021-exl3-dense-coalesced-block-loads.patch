@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mia <mia.ailab1@gmail.com>
+Date: Wed, 21 Oct 2026 09:05:51 +0300
+Subject: [PATCH] exl3 dense coalesced block loads
+
+---
+ zig/kernels/cuda/exl3_candidate.cu | 92 +++++++++++++++++++++---------
+ zig/src/cuda/exl3_candidate.zig    |  2 +-
+ 2 files changed, 67 insertions(+), 27 deletions(-)
+
+diff --git a/zig/kernels/cuda/exl3_candidate.cu b/zig/kernels/cuda/exl3_candidate.cu
+index b6af079..03697f9 100644
+--- a/zig/kernels/cuda/exl3_candidate.cu
++++ b/zig/kernels/cuda/exl3_candidate.cu
+@@ -266,47 +266,86 @@ extern "C" __global__ void __launch_bounds__(32) tf_exl3_rotate_f(const __nv_bfl
+ }
+ 
+ // Decode rows on the tensor units, 1-16 a launch: tf_exl3_rotate_f's rows as A fragments, the same at every count.
++//
++// The trellis streams in through the whole block: a 128-block of k is 8 tile rows, and the block's 8 tile columns of a row are
++// one contiguous 256 * bits-byte span, so all 256 threads load 16-byte chunks of the 8 spans in flat order (fully coalesced,
++// the shape that keeps GB10's memory busiest), two k blocks ahead in registers, then through two shared-memory buffers
++// (`smem`, 4096 * bits bytes) to the warp that decodes the tile. Every tile still decodes the same words in the same order
++// into the same mma chain, so the sums are the bits of the per-warp loads this replaced.
++__device__ __forceinline__ uint4 tf_exl3_ldg16(const void* p) {
++  uint4 v;
++  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
++  return v;
++}
++
+ template <int K, int C>
+ __device__ __forceinline__ void tf_exl3_tc_job(const __half* Xh, const uint8_t* T, const __half* svh, const TfExl3Rows a,
+-                                               const TfExl3Matrix m, uint8_t* Y, float* ws, unsigned* tickets, float* zs) {
+-  constexpr unsigned TB = 32 * K;
++                                                  const TfExl3Matrix m, uint8_t* Y, float* ws, unsigned* tickets, float* zs, uint8_t* smem) {
++  constexpr unsigned TB = 32 * K, SEG = 8 * TB, CPR = SEG / 16, CH = 8 * CPR, NJ = (CH + 255) / 256, STAGE_B = 8 * SEG;
+   const unsigned tid = threadIdx.x, sg = tid / 32, lane = tid % 32, g8 = lane / 4, t4 = lane % 4, ob = blockIdx.x;
+   const unsigned rows = a.rows < 16 ? a.rows : 16, kb = m.k / 128, per = (kb + m.split - 1) / m.split;
+   const unsigned b0 = blockIdx.y * per, b1 = b0 + per < kb ? b0 + per : kb;
+   const uint64_t row_bytes = (uint64_t)m.tiles_n * TB;
+-  const uint8_t* col = T + (uint64_t)(8 * ob + sg) * TB;
++  const uint8_t* base = T + (uint64_t)(8 * ob) * TB;
+   const bool lo = g8 < rows, hi = g8 + 8 < rows;
+-  // a lane's A words of a 128-block, rows g8 and g8 + 8 (r 0-7: columns 2t4, 2t4 + 8), loaded a block ahead
+-  const uint4* x0 = reinterpret_cast<const uint4*>(Xh + (uint64_t)(lo ? g8 : 0) * m.k + 32 * t4);
+-  const uint4* x1 = reinterpret_cast<const uint4*>(Xh + (uint64_t)(hi ? g8 + 8 : 0) * m.k + 32 * t4);
++  const __half* x0 = Xh + (uint64_t)(lo ? g8 : 0) * m.k + 32 * t4;
++  const __half* x1 = Xh + (uint64_t)(hi ? g8 + 8 : 0) * m.k + 32 * t4;
+   float acc[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+-  uint4 next = tf_exl3_words<K>(reinterpret_cast<const uint32_t*>(col + (uint64_t)(8 * b0) * row_bytes), lane);
+-  uint4 an[2][4];
+-  for (int q = 0; q < 4; ++q) {
+-    an[0][q] = lo ? __ldg(x0 + b0 * 16 + q) : make_uint4(0, 0, 0, 0);
+-    an[1][q] = hi ? __ldg(x1 + b0 * 16 + q) : make_uint4(0, 0, 0, 0);
++  // this thread's chunks: source offset inside the stage's rows, destination offset inside the stage buffer
++  uint64_t so[NJ];
++  unsigned dofs[NJ];
++#pragma unroll
++  for (unsigned j = 0; j < NJ; ++j) {
++    const unsigned c = tid + 256 * j, rr = c / CPR, cc = c % CPR;
++    so[j] = (uint64_t)rr * row_bytes + 16 * cc;
++    dofs[j] = rr * SEG + 16 * cc;
+   }
+-  for (unsigned ib = b0; ib < b1; ++ib) {
+-    uint32_t au[2][16];
+-    for (int q = 0; q < 4; ++q) {
+-      au[0][4 * q] = an[0][q].x, au[0][4 * q + 1] = an[0][q].y, au[0][4 * q + 2] = an[0][q].z, au[0][4 * q + 3] = an[0][q].w;
+-      au[1][4 * q] = an[1][q].x, au[1][4 * q + 1] = an[1][q].y, au[1][4 * q + 2] = an[1][q].z, au[1][4 * q + 3] = an[1][q].w;
++  auto ldstage = [&](uint4 (&R)[NJ], unsigned ib) {
++    if (ib < b1) {
++#pragma unroll
++      for (unsigned j = 0; j < NJ; ++j)
++        if (tid + 256 * j < CH) R[j] = tf_exl3_ldg16(base + (uint64_t)(8 * ib) * row_bytes + so[j]);
+     }
+-    if (ib + 1 < b1)
+-      for (int q = 0; q < 4; ++q) {
+-        an[0][q] = lo ? __ldg(x0 + (ib + 1) * 16 + q) : make_uint4(0, 0, 0, 0);
+-        an[1][q] = hi ? __ldg(x1 + (ib + 1) * 16 + q) : make_uint4(0, 0, 0, 0);
+-      }
++  };
++  auto ststage = [&](const uint4 (&R)[NJ], unsigned slot) {
++#pragma unroll
++    for (unsigned j = 0; j < NJ; ++j)
++      if (tid + 256 * j < CH) *reinterpret_cast<uint4*>(smem + slot * STAGE_B + dofs[j]) = R[j];
++  };
++  auto decode = [&](unsigned ib, unsigned slot) {
++    const uint32_t* st = reinterpret_cast<const uint32_t*>(smem + slot * STAGE_B) + sg * (TB / 4);
+ #pragma unroll
+     for (unsigned r = 0; r < 8; ++r) {
+-      const uint4 now = next;
+-      next = tf_exl3_words<K>(reinterpret_cast<const uint32_t*>(col + (uint64_t)(r < 7 ? 8 * ib + r + 1 : (ib + 1 < b1 ? 8 * ib + 8 : 8 * ib + 7)) * row_bytes), lane);
+-      const uint32_t af[4] = {au[0][2 * r], au[1][2 * r], au[0][2 * r + 1], au[1][2 * r + 1]};
++      const uint4 now = tf_exl3_words<K>(st + r * (SEG / 4), lane);
++      uint2 l2 = lo ? __ldg(reinterpret_cast<const uint2*>(x0 + ib * 128 + 4 * r)) : make_uint2(0, 0);
++      uint2 h2 = hi ? __ldg(reinterpret_cast<const uint2*>(x1 + ib * 128 + 4 * r)) : make_uint2(0, 0);
++      const uint32_t af[4] = {l2.x, h2.x, l2.y, h2.y};
+       __half w[8];
+       tf_exl3_unpack<K, C>(now, lane, w);
+       tf_exl3_mma(acc[0], af, tf_exl3_pair(w[0], w[1]), tf_exl3_pair(w[2], w[3]));
+       tf_exl3_mma(acc[1], af, tf_exl3_pair(w[4], w[5]), tf_exl3_pair(w[6], w[7]));
+     }
++  };
++  uint4 A[NJ], B[NJ];
++  if (b0 < b1) {
++    ldstage(A, b0);
++    ststage(A, 0);
++    ldstage(A, b0 + 1);
++    ldstage(B, b0 + 2);
++    __syncthreads();
++  }
++#pragma unroll 1
++  for (unsigned ib = b0; ib < b1; ib += 2) {
++    decode(ib, 0);                       // stage ib is in slot 0 (ib - b0 even), A holds ib + 1, B holds ib + 2
++    if (ib + 1 < b1) ststage(A, 1);
++    ldstage(A, ib + 3);
++    __syncthreads();
++    if (ib + 1 < b1) {
++      decode(ib + 1, 1);
++      if (ib + 2 < b1) ststage(B, 0);
++      ldstage(B, ib + 4);
++      __syncthreads();
++    }
+   }
+ #pragma unroll
+   for (int n = 0; n < 2; ++n)
+@@ -322,12 +361,13 @@ __device__ __forceinline__ void tf_exl3_tc_job(const __half* Xh, const uint8_t*
+ }
+ 
+ #define TF_EXL3_TC_CASE(B, C) \
+-  case B: tf_exl3_tc_job<B, C>(Xh, T, svh, a, m, Y, ws, tickets, zs); break;
++  case B: tf_exl3_tc_job<B, C>(Xh, T, svh, a, m, Y, ws, tickets, zs, smem); break;
+ #define TF_EXL3_TC(C)                                                                                                \
+-  extern "C" __global__ void __launch_bounds__(256) tf_exl3_tc_##C(const __half* Xh, const uint8_t* T, const __half* svh, \
++  extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_tc_##C(const __half* Xh, const uint8_t* T, const __half* svh, \
+                                                                   const TfExl3Rows a, const TfExl3Matrix m, uint8_t* Y, \
+                                                                   float* ws, unsigned* tickets) {                   \
+     __shared__ __align__(16) float zs[16 * 128];                                                                     \
++    extern __shared__ __align__(16) uint8_t smem[];                                                                  \
+     switch (m.bits) {                                                                                                \
+       TF_EXL3_TC_CASE(1, C) TF_EXL3_TC_CASE(2, C) TF_EXL3_TC_CASE(3, C) TF_EXL3_TC_CASE(4, C)                        \
+       TF_EXL3_TC_CASE(5, C) TF_EXL3_TC_CASE(6, C) TF_EXL3_TC_CASE(7, C) TF_EXL3_TC_CASE(8, C)                        \
+diff --git a/zig/src/cuda/exl3_candidate.zig b/zig/src/cuda/exl3_candidate.zig
+index 57341e0..4da49d6 100644
+--- a/zig/src/cuda/exl3_candidate.zig
++++ b/zig/src/cuda/exl3_candidate.zig
+@@ -118,7 +118,7 @@ pub const Kernels = struct {
+             a.add(out + at * m.n * elem);
+             a.add(k.parts.ptr);
+             a.add(k.tickets.ptr);
+-            try launch_.launch(k.decode_fns[@backingInt(m.codebook)], .{ .grid = .{ .x = @intCast(m.n / 128), .y = @intCast(split(m.k, m.n)), .z = 1 }, .block = .{ .x = 256 } }, s, &a);
++            try launch_.launch(k.decode_fns[@backingInt(m.codebook)], .{ .grid = .{ .x = @intCast(m.n / 128), .y = @intCast(split(m.k, m.n)), .z = 1 }, .block = .{ .x = 256 }, .shared = 4096 * m.bits }, s, &a);
+         }
+     }
+ 

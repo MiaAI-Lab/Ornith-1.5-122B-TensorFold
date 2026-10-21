@@ -1,0 +1,523 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mia <mia.ailab1@gmail.com>
+Date: Wed, 21 Oct 2026 08:18:24 +0300
+Subject: [PATCH] exl3 prompt kernels, dense v2
+
+---
+ zig/kernels/cuda/exl3_candidate.cu       |  71 ++++++++++++++
+ zig/kernels/cuda/exl3_experts.cu         |  22 +++--
+ zig/kernels/cuda/exl3_prompt.cuh         | 113 +++++++++++++++--------
+ zig/src/cuda/exl3_candidate.zig          |  13 ++-
+ zig/src/cuda/exl3_prompt.zig             |  23 +++--
+ zig/src/families/qwen3_5/cuda_routed.zig |   5 +-
+ 6 files changed, 190 insertions(+), 57 deletions(-)
+
+diff --git a/zig/kernels/cuda/exl3_candidate.cu b/zig/kernels/cuda/exl3_candidate.cu
+index a288cb5..b6af079 100644
+--- a/zig/kernels/cuda/exl3_candidate.cu
++++ b/zig/kernels/cuda/exl3_candidate.cu
+@@ -176,6 +176,77 @@ TF_EXL3_PROMPT(0)
+ TF_EXL3_PROMPT(1)
+ TF_EXL3_PROMPT(2)
+ 
++// Prompt v2: TF_DENSE_TP rows x 128 columns a block of four warps (two 16-column weight tiles each), the expert kernels' ring
++// of cp.async stages with ldmatrix'd rows (exl3_prompt.cuh), so a weight tile decodes once for TF_DENSE_TP rows. The sums are
++// accumulated in the same k order as the kernels above and finished the same way.
++#include "exl3_decode.cuh"
++#include "exl3_prompt.cuh"
++#ifndef TF_DENSE_TP
++#define TF_DENSE_TP 128
++#endif
++#ifndef TF_DENSE_NW
++#define TF_DENSE_NW 8   // warps a block: 8 / NW weight tiles each
++#endif
++#ifndef TF_DENSE_BLOCKS
++#define TF_DENSE_BLOCKS 2
++#endif
++constexpr int TF_DP_SMEM = 3 * tf_exl3_prompt::tstage_halves<TF_DENSE_TP, 16, 8>() * 2;
++static_assert(TF_DP_SMEM <= 48 * 1024, "the dense prompt stages must fit static shared memory");
++static_assert(TF_DP_SMEM >= (TF_DENSE_TP / 2) * (128 + 4) * 4, "the epilogue sums reuse the stages");
++
++template <int K2, int C>
++__device__ __forceinline__ void tf_exl3_prompt2_job(const __half* Xh, unsigned rows, const uint8_t* T, const __half* svh,
++                                                    const TfExl3Matrix m, uint8_t* Y, unsigned y_f32, unsigned char* smem) {
++  using namespace tf_exl3_prompt;
++  constexpr int TP = TF_DENSE_TP, NW = TF_DENSE_NW, NBT = 8, TMTL = NBT / NW, TH = TP / 2, ES = 128 + 4;
++  __shared__ int rows_sh[TP];
++  const int ob = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++  const unsigned row0 = blockIdx.y * TP;
++  const int cnt = min((int)(rows - row0), TP);
++  for (int i = threadIdx.x; i < TP; i += NW * 32) rows_sh[i] = i < cnt ? (int)row0 + i : -1;
++  __syncthreads();
++  float acc[TMTL][TP / 8][4];
++  const uint32_t* Tw = reinterpret_cast<const uint32_t*>(T);
++  tmain<1, TP, K2, C, NW, NBT, TP>(Xh, Xh, Tw, Tw, rows_sh, cnt, (int)m.k, (int)m.tiles_n, ob, 1, reinterpret_cast<half*>(smem), acc);
++  float* E = reinterpret_cast<float*>(smem);
++  for (int hf = 0; hf < 2 && hf * TH < cnt; ++hf) {
++    if (hf) __syncthreads();   // the first half's rows are read
++    tspill(E, ES, warp * TMTL * 16, acc, hf);
++    __syncthreads();
++    for (int i = warp; i < TH && hf * TH + i < cnt; i += NW) {
++      float v[4];
++      for (int q = 0; q < 4; ++q) v[q] = E[i * ES + lane + 32 * q];
++      tf_exl3_fwht(v, lane);
++      for (int q = 0; q < 4; ++q) {
++        const unsigned c = ob * 128 + lane + 32 * q;
++        tf_exl3_store(Y, (uint64_t)(row0 + hf * TH + i) * m.n + c, __fmul_rn(v[q], __fmul_rn(__half2float(svh[c]), 0.125f)), y_f32);
++      }
++    }
++  }
++}
++
++#define TF_EXL3_PROMPT2(C)                                                                                           \
++  extern "C" __global__ void __launch_bounds__(TF_DENSE_NW * 32, TF_DENSE_BLOCKS) tf_exl3_prompt2_##C(const __half* Xh, unsigned rows,          \
++                                                                          const uint8_t* T, const __half* svh,      \
++                                                                          const TfExl3Matrix m, uint8_t* Y,          \
++                                                                          unsigned y_f32) {                          \
++    __shared__ __align__(16) unsigned char smem[TF_DP_SMEM];                                                         \
++    switch (m.bits) {                                                                                                \
++      case 1: tf_exl3_prompt2_job<2, C>(Xh, rows, T, svh, m, Y, y_f32, smem); break;                                 \
++      case 2: tf_exl3_prompt2_job<4, C>(Xh, rows, T, svh, m, Y, y_f32, smem); break;                                 \
++      case 3: tf_exl3_prompt2_job<6, C>(Xh, rows, T, svh, m, Y, y_f32, smem); break;                                 \
++      case 4: tf_exl3_prompt2_job<8, C>(Xh, rows, T, svh, m, Y, y_f32, smem); break;                                 \
++      case 5: tf_exl3_prompt2_job<10, C>(Xh, rows, T, svh, m, Y, y_f32, smem); break;                                \
++      case 6: tf_exl3_prompt2_job<12, C>(Xh, rows, T, svh, m, Y, y_f32, smem); break;                                \
++      case 7: tf_exl3_prompt2_job<14, C>(Xh, rows, T, svh, m, Y, y_f32, smem); break;                                \
++      case 8: tf_exl3_prompt2_job<16, C>(Xh, rows, T, svh, m, Y, y_f32, smem); break;                                \
++      default: break;                                                                                                \
++    }                                                                                                                \
++  }
++TF_EXL3_PROMPT2(0)
++TF_EXL3_PROMPT2(1)
++TF_EXL3_PROMPT2(2)
++
+ 
+ // Decode rows for the tensor units: tf_exl3_rotate_h's values, each 128-block in fragment order (t4, r, 4 halves).
+ extern "C" __global__ void __launch_bounds__(32) tf_exl3_rotate_f(const __nv_bfloat16* X, unsigned x_stride, const __half* suh,
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index aa93086..1094cc8 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -438,8 +438,16 @@ extern "C" __global__ void tf_exl3_plan_finish(const PlanStage a) {
+ }
+ 
+ // Transposed fp32 prompt accumulators in the shared EXL3 module; decode kernels above stay unchanged.
++#define TF_EXL3_PROMPT_GATEUP
+ #include "exl3_prompt.cuh"
+ using namespace tf_exl3_prompt;
++#ifndef TF_PROMPT_SMEM
++#define TF_PROMPT_SMEM 46080   // exl3_prompt.zig's smem
++#endif
++static_assert(tsmem_bytes<10>() <= TF_PROMPT_SMEM && tsmem_bytes<8>() <= TF_PROMPT_SMEM, "the host launches the prompt kernels with TF_PROMPT_SMEM");
++#ifndef TF_PROMPT_BLOCKS
++#define TF_PROMPT_BLOCKS (TF_NW == 8 && TPM == 64 ? 2 : 1)
++#endif
+ extern "C" __global__ void tf_exl3_prompt_rotate(const __nv_bfloat16* __restrict__ x, int x_stride, const half* __restrict__ suh,
+         half* __restrict__ out, int K) {
+     const int row = blockIdx.x, blk = blockIdx.y;
+@@ -460,20 +468,20 @@ __device__ __forceinline__ void prompt_gu_body(const half* __restrict__ Xg, cons
+         const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
+         const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
+         half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode, int e_lo, int e_hi) {
+-    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<K2>()];   // one buffer for either instantiation
++    extern __shared__ __align__(16) unsigned char smem_raw[];   // one buffer for either instantiation
+     __shared__ int rows_sh[TPM];
+     if (xdiv > 1) tgateup<TPM, K2, CB>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, smem_raw, rows_sh, e_lo, e_hi);
+     else tgateup<2 * TPM, K2, CB>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, 1, limit, act_mode, smem_raw, rows_sh, e_lo, e_hi);
+ }
+ 
+-extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu(const half* __restrict__ Xg, const half* __restrict__ Xu,
++extern "C" __global__ void __launch_bounds__(TF_NW * 32, TF_PROMPT_BLOCKS) tf_exl3_prompt_gu(const half* __restrict__ Xg, const half* __restrict__ Xu,
+         const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
+         const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
+         half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode) {
+     prompt_gu_body<8, CB_MCG>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, 0, 0x7fffffff);
+ }
+ #define TF_PROMPT_GU_MUL1(NAME, K2) \
+-extern "C" __global__ void __launch_bounds__(256, 2) NAME(const half* __restrict__ Xg, const half* __restrict__ Xu, \
++extern "C" __global__ void __launch_bounds__(TF_NW * 32, TF_PROMPT_BLOCKS) NAME(const half* __restrict__ Xg, const half* __restrict__ Xu, \
+         const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts, \
+         const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d, \
+         half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode, int e_lo, int e_hi) { \
+@@ -488,7 +496,7 @@ __device__ __forceinline__ void prompt_down_body(const half* __restrict__ Xd, co
+         float* __restrict__ y, int K, int D, int ys, int e_lo, int e_hi)
+ {
+ 
+-    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<K2>()];
++    extern __shared__ __align__(16) unsigned char smem_raw[];
+     __shared__ int rows_sh[TPM];
+     const int cb = blockIdx.x, item = blockIdx.y;
+     if (item >= counts[0]) return;
+@@ -498,7 +506,7 @@ __device__ __forceinline__ void prompt_down_body(const half* __restrict__ Xd, co
+     __syncthreads();
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     float acc[TMT][TNB][4];
+-    tmain<1, TPM, K2, CB>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
++    tmain<1, TPM, K2, CB>(Xd, Xd, reinterpret_cast<const uint32_t*>(Td[e]), reinterpret_cast<const uint32_t*>(Td[e]), rows_sh, cnt, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
+     float* Ed = reinterpret_cast<float*>(smem_raw);
+     for (int hf = 0; hf < 2 && hf * TPH < cnt; ++hf) {
+         if (hf) __syncthreads();
+@@ -521,13 +529,13 @@ __device__ __forceinline__ void prompt_down_body(const half* __restrict__ Xd, co
+     }
+ }
+ 
+-extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
++extern "C" __global__ void __launch_bounds__(TF_NW * 32, TF_PROMPT_BLOCKS) tf_exl3_prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+         float* __restrict__ y, int K, int D, int ys) {
+     prompt_down_body<8, CB_MCG>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, 0, 0x7fffffff);
+ }
+ #define TF_PROMPT_DOWN_MUL1(NAME, K2) \
+-extern "C" __global__ void __launch_bounds__(256, 2) NAME(const half* __restrict__ Xd, const uint64_t* __restrict__ Td, \
++extern "C" __global__ void __launch_bounds__(TF_NW * 32, TF_PROMPT_BLOCKS) NAME(const half* __restrict__ Xd, const uint64_t* __restrict__ Td, \
+         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d, \
+         float* __restrict__ y, int K, int D, int ys, int e_lo, int e_hi) { \
+     prompt_down_body<K2, CB_MUL1>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, e_lo, e_hi); \
+diff --git a/zig/kernels/cuda/exl3_prompt.cuh b/zig/kernels/cuda/exl3_prompt.cuh
+index 66fb463..2ba1da5 100644
+--- a/zig/kernels/cuda/exl3_prompt.cuh
++++ b/zig/kernels/cuda/exl3_prompt.cuh
+@@ -26,61 +26,72 @@ __device__ __forceinline__ void ldmatrix_x4(uint32_t (&a)[4], const half* p) {
+ }
+ namespace tf_exl3_prompt {
+ 
+-constexpr int TPM = 64, TNW = 8, TMT = 16 / TNW, TNB = TPM / 8, TT = TNW * 32, TPH = TPM / 2;
++#ifndef TF_TPM
++#define TF_TPM 64
++#endif
++#ifndef TF_NW
++#define TF_NW 8
++#endif
++constexpr int TPM = TF_TPM, TNW = TF_NW, TNB = TPM / 8, TT = TNW * 32, TPH = TPM / 2;   // tokens an item, the experts' warps, n8 token blocks
++constexpr int BT = 16;                                                                      // the experts' weight tiles a block (16 columns each)
++constexpr int TMT = BT / TNW;                                                               // weight tiles a warp (experts)
+ constexpr int TBK = 32, TKT = TBK / 16, TSTAGES = 3, TXS = TBK + 8;
+-template <int K2>
+-constexpr int twords() { return 16 * TKT * tile_words<K2>(); }
++template <int K2, int NBT = BT>
++__host__ __device__ constexpr int twords() { return NBT * TKT * tile_words<K2>(); }
+ constexpr int GU_ES = 128 + 4, DN_ES = 256 + 4;                        // the epilogue sums' row strides (floats)
+-template <int XR, int K2 = 8>
+-constexpr int tstage_halves() { return XR * TXS + 2 * twords<K2>(); }
++template <int XR, int K2 = 8, int NBT = BT>
++__host__ __device__ constexpr int tstage_halves() { return XR * TXS + 2 * twords<K2, NBT>(); }
++// Dynamic shared memory the experts' prompt kernels need (the host passes one figure for every K2 up to 10).
+ template <int K2 = 8>
+-constexpr int tsmem_bytes() {
++__host__ __device__ constexpr int tsmem_bytes() {
+     const int gu = TSTAGES * tstage_halves<2 * TPM, K2>() * 2;   // gate and up rows apart (no shared rotation)
+     const int ep = 2 * TPH * GU_ES * 4, dn = TPH * DN_ES * 4;
+     return gu > ep ? (gu > dn ? gu : dn) : (ep > dn ? ep : dn);
+ }
+ 
+-// Which (matrix, weight tile) warp-tile q (0..15) of column block cb is.
+-template <int MATS>
++// Which (matrix, weight tile) warp-tile q (0..NBT-1) of column block cb is: MATS = 2 puts the first half of the tiles in
++// the first matrix, the second half in the second.
++template <int MATS, int NBT = BT>
+ __device__ __forceinline__ void ttile(int q, int cb, int& mat, int& nt) {
+-    mat = MATS == 2 ? q >> 3 : 0;
+-    nt = MATS == 2 ? cb * 8 + (q & 7) : cb * 16 + q;
++    constexpr int PER = NBT / MATS;
++    mat = MATS == 2 ? q / PER : 0;
++    nt = cb * PER + (q % PER);
+ }
+ 
+-// Main loop: acc[i][nb] = warp tile i x members nb * 8 .. + 7 over K; XR rows a stage (TPM if X0 == X1, else 2 TPM).
+-template <int MATS, int XR, int K2 = 8, int CB = CB_MCG>
+-__device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* __restrict__ X1, const uint64_t* __restrict__ tp0,
+-        const uint64_t* __restrict__ tp1, const int* rows_sh, int cnt, int e, int K, int NTILES, int cb, int xdiv,
+-        half* stage, float (&acc)[TMT][TNB][4]) {
+-    constexpr int SH = tstage_halves<XR, K2>();
++// Main loop: acc[i][nb] = warp tile i x tokens nb * 8 .. + 7 over K; XR rows a stage (TPM if X0 == X1, else 2 TPM). A block
++// is NW warps of NBT / NW weight tiles each; T0 and T1 the matrices' tile streams ([K / 16, NTILES, tile words]).
++template <int MATS, int XR, int K2 = 8, int CB = CB_MCG, int NW = TNW, int NBT = BT, int TP = TPM>
++__device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
++        const uint32_t* __restrict__ T1, const int* rows_sh, int cnt, int K, int NTILES, int cb, int xdiv,
++        half* stage, float (&acc)[NBT / NW][TP / 8][4]) {
++    constexpr int TMTL = NBT / NW, TTL = NW * 32;
++    constexpr int SH = tstage_halves<XR, K2, NBT>();
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     int mat, nt_unused;
+-    ttile<MATS>(warp * TMT, cb, mat, nt_unused);
++    ttile<MATS, NBT>(warp * TMTL, cb, mat, nt_unused);
+     const int chunks = K / TBK;
+-    const uint32_t* T0 = reinterpret_cast<const uint32_t*>(tp0[e]);
+-    const uint32_t* T1 = reinterpret_cast<const uint32_t*>(tp1[e]);
+     const int nblocks = (cnt + 15) >> 4;   // 16-member blocks in use
+ #pragma unroll
+-    for (int i = 0; i < TMT; ++i)
++    for (int i = 0; i < TMTL; ++i)
+ #pragma unroll
+-        for (int j = 0; j < TNB; ++j)
++        for (int j = 0; j < TP / 8; ++j)
+ #pragma unroll
+             for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
+     auto load = [&](int chunk) {
+         half* dst = stage + (size_t)(chunk % TSTAGES) * SH;
+         const int k0 = chunk * TBK;
+-        for (int idx = threadIdx.x; idx < XR * (TBK / 8); idx += TT) {
+-            const int m = idx / (TPM * (TBK / 8)), rem = idx % (TPM * (TBK / 8)), i = rem / (TBK / 8), j = rem % (TBK / 8);
++        for (int idx = threadIdx.x; idx < XR * (TBK / 8); idx += TTL) {
++            const int m = idx / (TP * (TBK / 8)), rem = idx % (TP * (TBK / 8)), i = rem / (TBK / 8), j = rem % (TBK / 8);
+             if (i >= nblocks * 16) continue;   // a 16-member block without a member: never read
+             const int r = rows_sh[i];
+             const half* src = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : (r / xdiv)) * K + k0 + j * 8;
+-            cp_async16(dst + ((size_t)m * TPM + i) * TXS + j * 8, src, r >= 0);
++            cp_async16(dst + ((size_t)m * TP + i) * TXS + j * 8, src, r >= 0);
+         }
+         uint32_t* wdst = reinterpret_cast<uint32_t*>(dst + (size_t)XR * TXS);
+-        for (int idx = threadIdx.x; idx < 16 * TKT * K2; idx += TT) {   // 16-byte pieces of the 16 * K2-byte tile words
++        for (int idx = threadIdx.x; idx < NBT * TKT * K2; idx += TTL) {   // 16-byte pieces of the NBT * K2-byte tile words
+             const int q = idx / (TKT * K2), kk = (idx / K2) % TKT, part = idx % K2;
+             int wm, nt;
+-            ttile<MATS>(q, cb, wm, nt);
++            ttile<MATS, NBT>(q, cb, wm, nt);
+             const uint32_t* src = (wm ? T1 : T0) + (((size_t)chunk * TKT + kk) * NTILES + nt) * tile_words<K2>() + part * 4;
+             cp_async16(wdst + ((size_t)q * TKT + kk) * tile_words<K2>() + part * 4, src, true);
+         }
+@@ -96,45 +107,68 @@ __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* _
+         if (c + TSTAGES - 1 < chunks) load(c + TSTAGES - 1);
+         cp_async_commit();
+         const half* base = stage + (size_t)(c % TSTAGES) * SH;
+-        const half* xs = base + (size_t)(XR == TPM ? 0 : mat) * TPM * TXS;
++        const half* xs = base + (size_t)(XR == TP ? 0 : mat) * TP * TXS;
+         const uint32_t* ws = reinterpret_cast<const uint32_t*>(base + (size_t)XR * TXS);
+ #pragma unroll
+         for (int kk = 0; kk < TKT; ++kk) {
+-            uint32_t a[TMT][4];
++            uint32_t a[TMTL][4];
+ #pragma unroll
+-            for (int i = 0; i < TMT; ++i) {
++            for (int i = 0; i < TMTL; ++i) {
+                 uint32_t b0[2], b1[2];
+-                decode_tile_p<K2, CB>(ws + ((size_t)(warp * TMT + i) * TKT + kk) * tile_words<K2>(), lane, b0, b1);
++                decode_tile_p<K2, CB>(ws + ((size_t)(warp * TMTL + i) * TKT + kk) * tile_words<K2>(), lane, b0, b1);
+                 a[i][0] = b0[0]; a[i][1] = b1[0]; a[i][2] = b0[1]; a[i][3] = b1[1];
+             }
++#ifndef TF_PROMPT_PIPE
+ #pragma unroll
+-            for (int jb = 0; jb < TPM / 16; ++jb) {
++            for (int jb = 0; jb < TP / 16; ++jb) {
+                 if (jb < nblocks) {
+                     uint32_t r[4];
+                     const int row = jb * 16 + (lane & 7) + ((lane >> 4) & 1) * 8;
+                     ldmatrix_x4(r, xs + (size_t)row * TXS + kk * 16 + ((lane >> 3) & 1) * 8);
+                     const uint32_t bl[2] = {r[0], r[1]}, bh[2] = {r[2], r[3]};
+ #pragma unroll
+-                    for (int i = 0; i < TMT; ++i) {
++                    for (int i = 0; i < TMTL; ++i) {
+                         mma16816(acc[i][2 * jb], a[i], bl);
+                         mma16816(acc[i][2 * jb + 1], a[i], bh);
+                     }
+                 }
+             }
++#else
++            // the next 16-token block's rows are loaded before this block's mma issue
++            const half* xk = xs + (size_t)((lane & 7) + ((lane >> 4) & 1) * 8) * TXS + kk * 16 + ((lane >> 3) & 1) * 8;
++            uint32_t rc[4], rn[4];
++            ldmatrix_x4(rc, xk);
++#pragma unroll
++            for (int jb = 0; jb < TP / 16; ++jb) {
++                if (jb < nblocks) {
++                    const bool more = jb + 1 < TP / 16 && jb + 1 < nblocks;
++                    if (more) ldmatrix_x4(rn, xk + (size_t)(jb + 1) * 16 * TXS);
++                    const uint32_t bl[2] = {rc[0], rc[1]}, bh[2] = {rc[2], rc[3]};
++#pragma unroll
++                    for (int i = 0; i < TMTL; ++i) {
++                        mma16816(acc[i][2 * jb], a[i], bl);
++                        mma16816(acc[i][2 * jb + 1], a[i], bh);
++                    }
++                    if (more) { rc[0] = rn[0]; rc[1] = rn[1]; rc[2] = rn[2]; rc[3] = rn[3]; }
++                }
++            }
++#endif
+         }
+     }
+     cp_async_wait<0>();
+     __syncthreads();   // the stages become the epilogue's sums
+ }
+ 
+-// acc (members TPH * hf .. + TPH - 1) -> E[member - TPH * hf][col] fp32, row stride ES; col0: first tile's column.
+-__device__ __forceinline__ void tspill(float* E, int ES, int col0, const float (&acc)[TMT][TNB][4], int hf) {
++// acc (tokens TPH * hf .. + TPH - 1) -> E[token - TPH * hf][col] fp32, row stride ES; col0: first tile's column.
++template <int TMTL, int TNBL>
++__device__ __forceinline__ void tspill(float* E, int ES, int col0, const float (&acc)[TMTL][TNBL][4], int hf) {
++    constexpr int TP = TNBL * 8;
+     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+ #pragma unroll
+-    for (int i = 0; i < TMT; ++i)
++    for (int i = 0; i < TMTL; ++i)
+ #pragma unroll
+-        for (int q = 0; q < TPM / 16; ++q) {
+-            const int nb = hf * (TPM / 16) + q;
++        for (int q = 0; q < TP / 16; ++q) {
++            const int nb = hf * (TP / 16) + q;
+             const int tok = q * 8 + 2 * t, col = col0 + i * 16 + g;
+             E[(size_t)tok * ES + col] = acc[i][nb][0];
+             E[(size_t)(tok + 1) * ES + col] = acc[i][nb][1];
+@@ -143,6 +177,7 @@ __device__ __forceinline__ void tspill(float* E, int ES, int col0, const float (
+         }
+ }
+ 
++#ifdef TF_EXL3_PROMPT_GATEUP   // needs exl3_experts.cu's bf16r, upTo and within
+ template <int XR, int K2 = 8, int CB = CB_MCG>
+ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half* __restrict__ Xu, const uint64_t* __restrict__ Tg,
+         const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members,
+@@ -156,7 +191,7 @@ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half*
+     __syncthreads();
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     float acc[TMT][TNB][4];
+-    tmain<2, XR, K2, CB>(Xg, Xu, Tg, Tu, rows_sh, cnt, e, K, N >> 4, cb, xdiv, reinterpret_cast<half*>(smem_raw), acc);
++    tmain<2, XR, K2, CB>(Xg, Xu, reinterpret_cast<const uint32_t*>(Tg[e]), reinterpret_cast<const uint32_t*>(Tu[e]), rows_sh, cnt, K, N >> 4, cb, xdiv, reinterpret_cast<half*>(smem_raw), acc);
+     float* Eg = reinterpret_cast<float*>(smem_raw);
+     int mat, nt;
+     ttile<2>(warp * TMT, cb, mat, nt);
+@@ -197,4 +232,6 @@ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half*
+     }
+ }
+ 
++#endif
++
+ }  // namespace tf_exl3_prompt
+diff --git a/zig/src/cuda/exl3_candidate.zig b/zig/src/cuda/exl3_candidate.zig
+index c894f33..775f41c 100644
+--- a/zig/src/cuda/exl3_candidate.zig
++++ b/zig/src/cuda/exl3_candidate.zig
+@@ -44,7 +44,9 @@ pub const MatrixArgs = extern struct { k: u32, n: u32, bits: u32, tiles_n: u32,
+ /// Decode rows a launch; longer decode runs go window by window.
+ pub const window = 16;
+ /// Prompt rows a chunk: rotated to fp16 together, then 64 rows a block on the tensor units.
+-pub const prompt_chunk = 256;
++pub const prompt_chunk = 2048;
++/// Rows a prompt2 block takes (exl3_candidate.cu's TF_DENSE_TP).
++const prompt2_rows = 128;
+ /// Blocks a launch aims for: a matrix with fewer 128-column blocks splits its input blocks into parts.
+ const target_blocks = 96;
+ 
+@@ -63,6 +65,8 @@ pub fn split(k: usize, n: usize) usize {
+ pub const Kernels = struct {
+     decode_fns: [3]Function, // 1-16 rows on the tensor units, by codebook
+     prompt_fns: [3]Function, // 64 rows a block on the tensor units, by codebook
++    prompt2_fns: [3]Function, // prompt2_rows a block: staged tiles decoded once for all of them (TF_EXL3_DENSE_V1 keeps the above)
++    v1: bool = false,
+     rotate_f_fn: Function, // decode rows, each 128-block in fragment order
+     rotate_h_fn: Function, // prompt rows, plain order
+     codebook_fn: Function,
+@@ -73,11 +77,12 @@ pub const Kernels = struct {
+     k_max: usize,
+ 
+     pub fn resolve(d: *const Driver, mod: module.Module, k_max: usize) !Kernels {
+-        var k: Kernels = .{ .decode_fns = undefined, .prompt_fns = undefined, .rotate_f_fn = try mod.function("tf_exl3_rotate_f"), .rotate_h_fn = try mod.function("tf_exl3_rotate_h"), .codebook_fn = try mod.function("tf_exl3_codebook"), .unpack_fn = try mod.function("tf_exl3_unpack"), .rotated = undefined, .parts = undefined, .tickets = undefined, .k_max = k_max };
+-        for (&k.decode_fns, &k.prompt_fns, 0..) |*f, *p, c| {
++        var k: Kernels = .{ .decode_fns = undefined, .prompt_fns = undefined, .prompt2_fns = undefined, .v1 = std.c.getenv("TF_EXL3_DENSE_V1") != null, .rotate_f_fn = try mod.function("tf_exl3_rotate_f"), .rotate_h_fn = try mod.function("tf_exl3_rotate_h"), .codebook_fn = try mod.function("tf_exl3_codebook"), .unpack_fn = try mod.function("tf_exl3_unpack"), .rotated = undefined, .parts = undefined, .tickets = undefined, .k_max = k_max };
++        for (&k.decode_fns, &k.prompt_fns, &k.prompt2_fns, 0..) |*f, *p, *p2, c| {
+             var name: [32]u8 = undefined;
+             f.* = try mod.function(try std.fmt.bufPrintSentinel(&name, "tf_exl3_tc_{d}", .{c}, 0));
+             p.* = try mod.function(try std.fmt.bufPrintSentinel(&name, "tf_exl3_prompt_{d}", .{c}, 0));
++            p2.* = try mod.function(try std.fmt.bufPrintSentinel(&name, "tf_exl3_prompt2_{d}", .{c}, 0));
+         }
+         k.rotated = try memory.DeviceBuffer.alloc(d, prompt_chunk * k_max * 2);
+         errdefer k.rotated.free();
+@@ -133,7 +138,7 @@ pub const Kernels = struct {
+             a.add(m.args());
+             a.add(out + at * m.n * elem);
+             a.add(@as(u32, @intFromBool(f32_out)));
+-            try launch_.launch(k.prompt_fns[@backingInt(m.codebook)], .{ .grid = .{ .x = @intCast(m.n / 128), .y = @intCast((r + 63) / 64), .z = 1 }, .block = .{ .x = 256 } }, s, &a);
++            if (k.v1 or m.trellis % 16 != 0) try launch_.launch(k.prompt_fns[@backingInt(m.codebook)], .{ .grid = .{ .x = @intCast(m.n / 128), .y = @intCast((r + 63) / 64), .z = 1 }, .block = .{ .x = 256 } }, s, &a) else try launch_.launch(k.prompt2_fns[@backingInt(m.codebook)], .{ .grid = .{ .x = @intCast(m.n / 128), .y = @intCast((r + prompt2_rows - 1) / prompt2_rows), .z = 1 }, .block = .{ .x = 256 } }, s, &a);
+         }
+     }
+ 
+diff --git a/zig/src/cuda/exl3_prompt.zig b/zig/src/cuda/exl3_prompt.zig
+index 365191b..2a94012 100644
+--- a/zig/src/cuda/exl3_prompt.zig
++++ b/zig/src/cuda/exl3_prompt.zig
+@@ -7,7 +7,10 @@ const Module = @import("module.zig").Module;
+ const Function = @import("module.zig").Function;
+ const Stream = @import("stream.zig").Stream;
+ 
++/// Pairs a plan item holds (exl3_prompt.cuh's TF_TPM) and the dynamic shared memory the kernels launch with (its tsmem_bytes for 10-bit tiles).
+ pub const tile = 64;
++pub const smem: u32 = 46080;
++pub const block_threads: u32 = 256;
+ pub const Scratch = struct { xg: u64, xu: u64, xd: u64, y: u64, rows: usize, slots: usize };
+ pub fn eligible(l: ex.Layer) bool {
+     return l.codebook == .mcg and l.uniform_k2 == 8 and l.gu_stride == 0 and l.dims > 0 and l.width > 0 and l.dims % 256 == 0 and l.width % 128 == 0 and (l.act_mode == 0 or l.act_mode == 1);
+@@ -46,9 +49,12 @@ pub fn scratch(base: u64, l: ex.Layer, rows: usize, slots: usize) !Scratch {
+     return .{ .xg = base, .xu = if (l.shared_input) base else base + ns[0], .xd = base + ns[0] + ns[1], .y = base + ns[0] + ns[1] + ns[2], .rows = rows, .slots = slots };
+ }
+ fn go(f: Function, s: Stream, grid: [3]usize, threads: u32, values: anytype) !void {
++    return goShared(f, s, grid, threads, smem, values);
++}
++fn goShared(f: Function, s: Stream, grid: [3]usize, threads: u32, shared: u32, values: anytype) !void {
+     var args: launch.Args = .{};
+     inline for (values) |v| args.add(v);
+-    try launch.launch(f, .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = threads } }, s, &args);
++    try launch.launch(f, .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = threads }, .shared = shared }, s, &args);
+ }
+ fn i(n: usize) i32 {
+     return @intCast(n);
+@@ -62,6 +68,11 @@ pub const Kernels = struct {
+     down_m8: Function,
+     down_m10: Function,
+     pub fn resolve(mod: Module) !Kernels {
++        const k = try resolveNames(mod);
++        inline for (.{ k.gateup, k.down, k.gu_m8, k.gu_m10, k.down_m8, k.down_m10 }) |f| try f.allowDynamicShared(smem);
++        return k;
++    }
++    fn resolveNames(mod: Module) !Kernels {
+         return .{
+             .rotate = try mod.function("tf_exl3_prompt_rotate"), .gateup = try mod.function("tf_exl3_prompt_gu"), .down = try mod.function("tf_exl3_prompt_down"),
+             .gu_m8 = try mod.function("tf_exl3_prompt_gu_m8"), .gu_m10 = try mod.function("tf_exl3_prompt_gu_m10"),
+@@ -81,8 +92,8 @@ pub const Kernels = struct {
+         const fs = [2]Function{ k.gu_m8, k.gu_m10 };
+         const ds = [2]Function{ k.down_m8, k.down_m10 };
+         const ranges = [2][2]i32{ .{ 0, tail }, .{ tail, i(l.experts) } };
+-        for (fs, ranges) |f, r| try go(f, s, .{ l.width / 128, items, 1 }, 256, .{ xg, xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, xd, i(l.dims), i(l.width), i(1), l.limit, l.act_mode, r[0], r[1] });
+-        for (ds, ranges) |f, r| try go(f, s, .{ l.dims / 256, items, 1 }, 256, .{ xd, l.down, p.items, p.counts, p.members, l.svh_d, y, i(l.width), i(l.dims), i(slots), r[0], r[1] });
++        for (fs, ranges) |f, r| try go(f, s, .{ l.width / 128, items, 1 }, block_threads, .{ xg, xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, xd, i(l.dims), i(l.width), i(1), l.limit, l.act_mode, r[0], r[1] });
++        for (ds, ranges) |f, r| try go(f, s, .{ l.dims / 256, items, 1 }, block_threads, .{ xd, l.down, p.items, p.counts, p.members, l.svh_d, y, i(l.width), i(l.dims), i(slots), r[0], r[1] });
+     }
+     pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan) !void {
+         if (!eligible(l) or rows == 0 or rows > sc.rows or stride < l.dims or stride > std.math.maxInt(i32)) return error.Exl3Shape;
+@@ -90,14 +101,14 @@ pub const Kernels = struct {
+         const pairs = rows * sc.slots;
+         try router.route(s, picks, pairs, l.experts, tile, p);
+         if (l.shared_input) {
+-            try go(k.rotate, s, .{ rows, l.dims / 128, 1 }, 32, .{ x, i(stride), l.suh_g, sc.xg, i(l.dims) });
++            try goShared(k.rotate, s, .{ rows, l.dims / 128, 1 }, 32, 0, .{ x, i(stride), l.suh_g, sc.xg, i(l.dims) });
+         } else {
+             var args: launch.Args = .{};
+             inline for (.{ x, i(stride), @as(i32, @backingInt(ex.DType.bf16)), picks, l.suh_g, l.suh_u, sc.xg, sc.xu, i(l.dims), i(sc.slots), i(l.experts) }) |v| args.add(v);
+             try launch.launch(e.rot_in, .{ .grid = .{ .x = @intCast(pairs), .y = @intCast(l.dims / 128), .z = 2 }, .block = .{ .x = 32 } }, s, &args);
+         }
+         const items = grouped.maxItems(pairs, l.experts, tile);
+-        try go(k.gateup, s, .{ l.width / 128, items, 1 }, 256, .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode });
+-        try go(k.down, s, .{ l.dims / 256, items, 1 }, 256, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, sc.y, i(l.width), i(l.dims), i(sc.slots) });
++        try go(k.gateup, s, .{ l.width / 128, items, 1 }, block_threads, .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode });
++        try go(k.down, s, .{ l.dims / 256, items, 1 }, block_threads, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, sc.y, i(l.width), i(l.dims), i(sc.slots) });
+     }
+ };
+diff --git a/zig/src/families/qwen3_5/cuda_routed.zig b/zig/src/families/qwen3_5/cuda_routed.zig
+index 67432a6..db407a1 100644
+--- a/zig/src/families/qwen3_5/cuda_routed.zig
++++ b/zig/src/families/qwen3_5/cuda_routed.zig
+@@ -47,7 +47,8 @@ pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, x: u64, out: u
+     const slots = g.slots();
+     const count = g.experts + 1;
+     const pairs = total * slots;
+-    const tile: usize = if (wide) 64 else 16;
++    const fused = wide and fused_prompt and layer.format == .exl3 and e.kit != null and cuda.exl3_experts.prompt.mixedEligible(layer.exl3.?);
++    const tile: usize = if (fused) cuda.exl3_experts.prompt.tile else if (wide) 64 else 16;
+     const items = cuda.grouped.maxItems(pairs, count, tile);
+     const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
+     const grouped: cuda.experts.Grouped = .{ .affine4 = &e.experts, .affine3 = &e.experts3, .exl3 = if (e.kit) |k| &k.grouped else null };
+@@ -56,7 +57,7 @@ pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, x: u64, out: u
+     try e.plan.route(e.stream, s.picks, pairs, count, tile, plan);
+     const rows_in: cuda.experts.Rows = .{ .x = x, .stride = g.hidden, .slots = slots };
+     const act_in: cuda.experts.Rows = .{ .x = s.act, .stride = g.intermediate };
+-    if (wide and fused_prompt and layer.format == .exl3 and e.kit != null and cuda.exl3_experts.prompt.mixedEligible(layer.exl3.?)) {
++    if (fused) {
+         // Fused tensor-core prompt kernels over the plan above: the grouped scratch holds the rotated gate and up rows,
+         // the activation scratch the rotated down inputs (fp16), y the fp32 expert outputs.
+         const kit = e.kit.?;

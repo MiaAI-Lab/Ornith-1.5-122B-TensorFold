@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mia <mia.ailab1@gmail.com>
+Date: Wed, 21 Oct 2026 08:18:07 +0300
+Subject: [PATCH] qwen35 router tiles and bf16 prompt rows
+
+---
+ zig/kernels/cuda/moe.cu                | 62 +++++++++++++++++++++++++
+ zig/kernels/cuda/qwen35_bf16.cu        | 64 ++++++++++++++++++++++++++
+ zig/src/cuda/moe.zig                   |  8 +++-
+ zig/src/families/qwen3_5/cuda_bf16.zig | 15 +++++-
+ 4 files changed, 146 insertions(+), 3 deletions(-)
+
+diff --git a/zig/kernels/cuda/moe.cu b/zig/kernels/cuda/moe.cu
+index 113b215..956600c 100644
+--- a/zig/kernels/cuda/moe.cu
++++ b/zig/kernels/cuda/moe.cu
+@@ -38,6 +38,68 @@ extern "C" __global__ void __launch_bounds__(256) tf_moe_router(const __nv_bfloa
+     if (row0 + rr < R && e0 + ee < E) OUT[static_cast<int64_t>(row0 + rr) * E + e0 + ee] = acc;
+ }
+ 
++// The same logits as tf_moe_router (each is one fp32 fma chain over D in index order) with a 4 x 4 register tile a thread:
++// 64 rows x 64 experts a block of 16 x 16 threads, D a multiple of 8, 16-byte aligned rows. Grid (rows / 64, E / 64), block 256.
++extern "C" __global__ void __launch_bounds__(256) tf_moe_router_t(const __nv_bfloat16* __restrict__ X, int x_stride,
++                                                                    const __nv_bfloat16* __restrict__ W, float* __restrict__ OUT,
++                                                                    int R, int D, int E) {
++    constexpr int BR = 64, BE = 64, KT = 64, KS = KT + 4;   // 68 halves: a row's 8-byte pieces rotate through the banks
++    __shared__ __align__(16) __nv_bfloat16 xs[BR][KS];
++    __shared__ __align__(16) __nv_bfloat16 ws[BE][KS];
++    const int row0 = blockIdx.x * BR, e0 = blockIdx.y * BE;
++    const int tx = threadIdx.x & 15, ty = threadIdx.x >> 4;
++    float acc[4][4];
++#pragma unroll
++    for (int i = 0; i < 4; ++i)
++#pragma unroll
++        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
++    for (int k0 = 0; k0 < D; k0 += KT) {
++        __syncthreads();
++        for (int c = threadIdx.x; c < BR * (KT / 8); c += 256) {
++            const int r = c / (KT / 8), kq = (c % (KT / 8)) * 8;
++            uint4 vx = make_uint4(0, 0, 0, 0), vw = make_uint4(0, 0, 0, 0);
++            if (k0 + kq < D) {
++                if (row0 + r < R) vx = *reinterpret_cast<const uint4*>(X + static_cast<int64_t>(row0 + r) * x_stride + k0 + kq);
++                if (e0 + r < E) vw = *reinterpret_cast<const uint4*>(W + static_cast<int64_t>(e0 + r) * D + k0 + kq);
++            }
++            *reinterpret_cast<uint2*>(&xs[r][kq]) = make_uint2(vx.x, vx.y);
++            *reinterpret_cast<uint2*>(&xs[r][kq + 4]) = make_uint2(vx.z, vx.w);
++            *reinterpret_cast<uint2*>(&ws[r][kq]) = make_uint2(vw.x, vw.y);
++            *reinterpret_cast<uint2*>(&ws[r][kq + 4]) = make_uint2(vw.z, vw.w);
++        }
++        __syncthreads();
++#pragma unroll 4
++        for (int kk = 0; kk < KT; kk += 4) {
++            float xv[4][4], wv[4][4];
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                const uint2 u = *reinterpret_cast<const uint2*>(&xs[ty + 16 * i][kk]);
++                xv[i][0] = __uint_as_float(u.x << 16); xv[i][1] = __uint_as_float(u.x & 0xffff0000u);
++                xv[i][2] = __uint_as_float(u.y << 16); xv[i][3] = __uint_as_float(u.y & 0xffff0000u);
++            }
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const uint2 u = *reinterpret_cast<const uint2*>(&ws[tx + 16 * j][kk]);
++                wv[j][0] = __uint_as_float(u.x << 16); wv[j][1] = __uint_as_float(u.x & 0xffff0000u);
++                wv[j][2] = __uint_as_float(u.y << 16); wv[j][3] = __uint_as_float(u.y & 0xffff0000u);
++            }
++#pragma unroll
++            for (int q = 0; q < 4; ++q)
++#pragma unroll
++                for (int i = 0; i < 4; ++i)
++#pragma unroll
++                    for (int j = 0; j < 4; ++j) acc[i][j] = __fmaf_rn(xv[i][q], wv[j][q], acc[i][j]);
++        }
++    }
++#pragma unroll
++    for (int i = 0; i < 4; ++i)
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const int r = row0 + ty + 16 * i, e = e0 + tx + 16 * j;
++            if (r < R && e < E) OUT[static_cast<int64_t>(r) * E + e] = acc[i][j];
++        }
++}
++
+ // Decode-sized rows (R <= 16): a warp per expert, its lanes striding 8 inputs each (16-byte loads), every row against the same
+ // weights; lane sums are combined by a fixed shuffle tree, so a row's logits do not depend on R. Grid (E / 4), block 128.
+ extern "C" __global__ void __launch_bounds__(128) tf_moe_router_rows(const __nv_bfloat16* __restrict__ X, int x_stride,
+diff --git a/zig/kernels/cuda/qwen35_bf16.cu b/zig/kernels/cuda/qwen35_bf16.cu
+index 7399289..7ed5fa6 100644
+--- a/zig/kernels/cuda/qwen35_bf16.cu
++++ b/zig/kernels/cuda/qwen35_bf16.cu
+@@ -49,3 +49,67 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_dense_bf16(const __nv_b
+         Y[r * (size_t)n + j] = __float2bfloat16_rn(s);
+     }
+ }
++
++// The same sums as tf_q35_dense_bf16 for prompt rows, RB rows a block and every output in turn: a row stays in shared memory,
++// each weight row's chunks are read once for all RB rows, and each (row, output) keeps the one-output kernel's order: thread t
++// adds chunks t, t + 256, ... (8 products each, in order), the butterfly over the warp, then the 8 warp sums in order.
++// Grid ceil(rows / RB), dynamic shared memory RB * k * 2 bytes (k % 8 == 0, x and W 16-byte aligned).
++constexpr int TF_DR_RB = 8, TF_DR_G = 4;
++extern "C" __global__ void __launch_bounds__(256) tf_q35_dense_bf16_rows(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
++                                                                          __nv_bfloat16* __restrict__ Y, int n, int k, int rows) {
++    extern __shared__ __align__(16) uint4 xs4[];
++    __shared__ float red[8][TF_DR_G * TF_DR_RB];
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const int r0 = blockIdx.x * TF_DR_RB, kc = k / 8;
++    const uint4* x4 = reinterpret_cast<const uint4*>(X);
++    const uint4* w4 = reinterpret_cast<const uint4*>(W);
++    for (int i = tid; i < TF_DR_RB * kc; i += 256) {
++        const int r = i / kc, c = i % kc;
++        xs4[i] = r0 + r < rows ? x4[(size_t)(r0 + r) * kc + c] : make_uint4(0, 0, 0, 0);
++    }
++    __syncthreads();
++    for (int j0 = 0; j0 < n; j0 += TF_DR_G) {
++        float acc[TF_DR_G][TF_DR_RB];
++#pragma unroll
++        for (int g = 0; g < TF_DR_G; ++g)
++#pragma unroll
++            for (int r = 0; r < TF_DR_RB; ++r) acc[g][r] = 0.0f;
++        for (int c = tid; c < kc; c += 256) {
++            uint4 xv[TF_DR_RB];
++#pragma unroll
++            for (int r = 0; r < TF_DR_RB; ++r) xv[r] = xs4[r * kc + c];
++#pragma unroll
++            for (int g = 0; g < TF_DR_G; ++g) {
++                if (j0 + g < n) {
++                    const uint4 wv = w4[(size_t)(j0 + g) * kc + c];
++                    const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wv);
++#pragma unroll
++                    for (int r = 0; r < TF_DR_RB; ++r) {
++                        const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xv[r]);
++#pragma unroll
++                        for (int e = 0; e < 8; e++) acc[g][r] = __fmaf_rn(__bfloat162float(xb[e]), __bfloat162float(wb[e]), acc[g][r]);
++                    }
++                }
++            }
++        }
++#pragma unroll
++        for (int g = 0; g < TF_DR_G; ++g)
++#pragma unroll
++            for (int r = 0; r < TF_DR_RB; ++r) {
++#pragma unroll
++                for (int o = 16; o > 0; o >>= 1) acc[g][r] += __shfl_xor_sync(0xffffffffu, acc[g][r], o);
++                if (lane == 0) red[warp][g * TF_DR_RB + r] = acc[g][r];
++            }
++        __syncthreads();
++        if (tid < TF_DR_G * TF_DR_RB) {
++            const int g = tid / TF_DR_RB, r = tid % TF_DR_RB;
++            if (j0 + g < n && r0 + r < rows) {
++                float s = red[0][tid];
++#pragma unroll
++                for (int i = 1; i < 8; i++) s += red[i][tid];
++                Y[(size_t)(r0 + r) * n + j0 + g] = __float2bfloat16_rn(s);
++            }
++        }
++        __syncthreads();
++    }
++}
+diff --git a/zig/src/cuda/moe.zig b/zig/src/cuda/moe.zig
+index 48548b0..77ed214 100644
+--- a/zig/src/cuda/moe.zig
++++ b/zig/src/cuda/moe.zig
+@@ -15,6 +15,8 @@ pub const max_top_k = 31;
+ pub const Fns = struct {
+     router_fn: Function,
+     router_rows_fn: Function,
++    router_t_fn: Function, // 64 x 64 tiles, the same logits as router_fn's
++    tiled: bool = true,
+     /// Decode-sized calls (<= 16 rows) take the warp-per-expert router (its logits differ from the tile kernel's in the last bits).
+     fast_rows: bool = false,
+     topk_fn: Function,
+@@ -22,7 +24,7 @@ pub const Fns = struct {
+ 
+     /// From the loaded moe module (kernels.moe).
+     pub fn resolve(mod: Module) !Fns {
+-        return .{ .router_fn = try mod.function("tf_moe_router"), .router_rows_fn = try mod.function("tf_moe_router_rows"), .topk_fn = try mod.function("tf_moe_topk"), .combine_fn = try mod.function("tf_moe_combine") };
++        return .{ .router_fn = try mod.function("tf_moe_router"), .router_rows_fn = try mod.function("tf_moe_router_rows"), .router_t_fn = try mod.function("tf_moe_router_t"), .tiled = std.c.getenv("TF_MOE_ROUTER_OLD") == null, .topk_fn = try mod.function("tf_moe_topk"), .combine_fn = try mod.function("tf_moe_combine") };
+     }
+ 
+     /// logits[r][e] = fp32 x[r] . w[e]: `rows` bf16 rows `x_stride` apart against `count` rows of `dims`, gate last.
+@@ -37,6 +39,10 @@ pub const Fns = struct {
+             const wide: launch_.Config = .{ .grid = .{ .x = @intCast((count + 3) / 4), .y = 1, .z = 1 }, .block = .{ .x = 128 } };
+             return launch_.launch(f.router_rows_fn, wide, s, &a);
+         }
++        if (f.tiled and rows > 16 and dims % 64 == 0 and x_stride % 8 == 0 and x % 16 == 0 and w % 16 == 0) {
++            const tiled: launch_.Config = .{ .grid = .{ .x = @intCast((rows + 63) / 64), .y = @intCast((count + 63) / 64), .z = 1 }, .block = .{ .x = 256 } };
++            return launch_.launch(f.router_t_fn, tiled, s, &a);
++        }
+         const cfg: launch_.Config = .{ .grid = .{ .x = @intCast((rows + 15) / 16), .y = @intCast((count + 15) / 16), .z = 1 }, .block = .{ .x = 256 } };
+         try launch_.launch(f.router_fn, cfg, s, &a);
+     }
+diff --git a/zig/src/families/qwen3_5/cuda_bf16.zig b/zig/src/families/qwen3_5/cuda_bf16.zig
+index 39e29b3..8747792 100644
+--- a/zig/src/families/qwen3_5/cuda_bf16.zig
++++ b/zig/src/families/qwen3_5/cuda_bf16.zig
+@@ -3,14 +3,17 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ 
+ const threads = 256;
++const rows_per_block = 8;
++const rows_smem: u32 = 98304; // rows_per_block rows of k <= 6144 bf16
+ 
+ pub const Kernels = struct {
+     mod: cuda.Module,
+     embed_fn: cuda.Function,
+     dense_fn: cuda.Function,
++    dense_rows_fn: cuda.Function, // prompt rows: 8 a block, the same sums
+ 
+     pub fn resolve(mod: cuda.Module) !Kernels {
+-        return .{ .mod = mod, .embed_fn = try mod.function("tf_q35_embed_bf16"), .dense_fn = try mod.function("tf_q35_dense_bf16") };
++        return .{ .mod = mod, .embed_fn = try mod.function("tf_q35_embed_bf16"), .dense_fn = try mod.function("tf_q35_dense_bf16"), .dense_rows_fn = try mod.function("tf_q35_dense_bf16_rows") };
+     }
+ 
+     /// Load the embedded module (owned: call unload) and resolve its functions.
+@@ -18,7 +21,9 @@ pub const Kernels = struct {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+         var mod = try cuda.Module.load(d, cuda.kernels.qwen35_bf16);
+         errdefer mod.unload();
+-        return resolve(mod);
++        const k = try resolve(mod);
++        try k.dense_rows_fn.allowDynamicShared(rows_smem);
++        return k;
+     }
+ 
+     pub fn unload(k: *Kernels) void {
+@@ -41,6 +46,12 @@ pub const Kernels = struct {
+     /// k % 8 == 0; x and w 16-byte aligned.
+     pub fn denseRows(kn: *const Kernels, s: cuda.Stream, x: u64, w: u64, out: u64, rows: usize, n: usize, k: usize) !void {
+         if (rows == 0 or n == 0) return;
++        if (rows >= 32 and k * 2 * rows_per_block <= rows_smem and k % 8 == 0 and n > 0 and x % 16 == 0 and w % 16 == 0 and k <= std.math.maxInt(i32) and n <= std.math.maxInt(i32) and rows <= std.math.maxInt(i32)) {
++            var a: cuda.launch.Args = .{};
++            for ([_]u64{ x, w, out }) |v| a.add(v);
++            for ([_]usize{ n, k, rows }) |v| a.add(@as(i32, @intCast(v)));
++            return cuda.launch.launch(kn.dense_rows_fn, .{ .grid = .{ .x = @intCast((rows + rows_per_block - 1) / rows_per_block), .y = 1, .z = 1 }, .block = .{ .x = threads }, .shared = @intCast(k * 2 * rows_per_block) }, s, &a);
++        }
+         if (rows > 128) { // 128-row blocks, each row's sum the same whatever the block
+             var at: usize = 0;
+             while (at < rows) : (at += 128) try kn.denseRows(s, x + at * k * 2, w, out + at * n * 2, @min(128, rows - at), n, k);

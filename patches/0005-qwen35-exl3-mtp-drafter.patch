@@ -1,0 +1,378 @@
+diff --git a/zig/src/families/qwen3_5/cuda_exl3_weights.zig b/zig/src/families/qwen3_5/cuda_exl3_weights.zig
+index c8eb999..7c9cc67 100644
+--- a/zig/src/families/qwen3_5/cuda_exl3_weights.zig
++++ b/zig/src/families/qwen3_5/cuda_exl3_weights.zig
+@@ -15,7 +15,7 @@ const aligned = engine.aligned;
+ const ex = cuda.exl3_experts;
+ 
+ /// The mul1 codebook marker's value (exl3_load.markers[1]).
+-const mul1_magic: u32 = 0x83DCD12D;
++pub const mul1_magic: u32 = 0x83DCD12D;
+ 
+ /// The EXL3 kernels beside the engine's own: dense rows, the grouped experts and the bf16 rows.
+ pub const Kit = struct {
+@@ -53,24 +53,30 @@ pub const Kit = struct {
+     }
+ };
+ 
+-/// Where tensors go: the engine's arena, or (measure) just counted with the same alignment.
+-const Sink = struct {
+-    e: *Engine,
+-    measure: bool,
+-    at: usize = 0,
++/// Where tensors go: the owner's arena (the engine's, or another's with `alloc` and `arena`), or (measure) just counted
++/// with the same alignment.
++pub fn SinkOf(comptime Owner: type) type {
++    return struct {
++        e: *Engine,
++        owner: *Owner,
++        measure: bool,
++        at: usize = 0,
+ 
+-    fn alloc(s: *Sink, bytes: usize) !u64 {
+-        if (!s.measure) return s.e.alloc(bytes);
+-        s.at = aligned(s.at) + bytes;
+-        return 0;
+-    }
++        pub fn alloc(s: *@This(), bytes: usize) !u64 {
++            if (!s.measure) return s.owner.alloc(bytes);
++            s.at = aligned(s.at) + bytes;
++            return 0;
++        }
+ 
+-    fn put(s: *Sink, bytes: []const u8) !u64 {
+-        const p = try s.alloc(bytes.len);
+-        if (!s.measure) try s.e.arena.upload(p - s.e.arena.ptr, bytes);
+-        return p;
+-    }
+-};
++        pub fn put(s: *@This(), bytes: []const u8) !u64 {
++            const p = try s.alloc(bytes.len);
++            if (!s.measure) try s.owner.arena.upload(p - s.owner.arena.ptr, bytes);
++            return p;
++        }
++    };
++}
++
++const Sink = SinkOf(Engine);
+ 
+ fn name(buf: []u8, comptime fmt: []const u8, args: anytype) ![]const u8 {
+     return std.fmt.bufPrint(buf, fmt, args);
+@@ -101,13 +107,13 @@ fn shifted(gpa: std.mem.Allocator, bytes: []const u8) ![]u16 {
+     return out;
+ }
+ 
+-fn plain(s: *Sink, ck: *core.Checkpoint, comptime fmt: []const u8, args: anytype, dtype: core.checkpoint.DType, shape: []const usize) !u64 {
++pub fn plain(s: anytype, ck: *core.Checkpoint, comptime fmt: []const u8, args: anytype, dtype: core.checkpoint.DType, shape: []const usize) !u64 {
+     var buf: [200]u8 = undefined;
+     return s.put((try ck.expect(try name(&buf, fmt, args), dtype, shape)).bytes);
+ }
+ 
+ /// A norm weight, shifted by one (see `shifted`).
+-fn norm1(s: *Sink, ck: *core.Checkpoint, comptime fmt: []const u8, args: anytype, n: usize) !u64 {
++pub fn norm1(s: anytype, ck: *core.Checkpoint, comptime fmt: []const u8, args: anytype, n: usize) !u64 {
+     var buf: [200]u8 = undefined;
+     const t = try ck.expect(try name(&buf, fmt, args), .bf16, &.{n});
+     const w = try shifted(s.e.gpa, t.bytes);
+@@ -127,9 +133,9 @@ fn f32vec(s: *Sink, ck: *core.Checkpoint, comptime fmt: []const u8, args: anytyp
+ }
+ 
+ /// One EXL3 group's tensors, checked: trellis [k/16][n/16][16 * bits] i16, the mul1 marker, fp16 suh [k] and svh [n].
+-const Group = struct { trellis: core.checkpoint.Tensor, suh: core.checkpoint.Tensor, svh: core.checkpoint.Tensor, halves: u32 };
++pub const Group = struct { trellis: core.checkpoint.Tensor, suh: core.checkpoint.Tensor, svh: core.checkpoint.Tensor, halves: u32 };
+ 
+-fn group(ck: *core.Checkpoint, base: []const u8, n: usize, k: usize) !Group {
++pub fn group(ck: *core.Checkpoint, base: []const u8, n: usize, k: usize) !Group {
+     var buf: [240]u8 = undefined;
+     const t = try ck.get(try name(&buf, "{s}.trellis", .{base}));
+     if (t.dtype != .i16 or t.rank != 3 or t.dim(0) != k / 16 or t.dim(1) != n / 16 or t.dim(2) % 8 != 0) {
+@@ -147,7 +153,7 @@ fn group(ck: *core.Checkpoint, base: []const u8, n: usize, k: usize) !Group {
+ }
+ 
+ /// An n-by-k EXL3 projection, its trellis kept as stored (Dense reads the stored layout).
+-fn dense(s: *Sink, kit: ?*Kit, ck: *core.Checkpoint, prefix: []const u8, mod: []const u8, n: usize, k: usize) !Proj {
++pub fn dense(s: anytype, kit: ?*Kit, ck: *core.Checkpoint, prefix: []const u8, mod: []const u8, n: usize, k: usize) !Proj {
+     var buf: [200]u8 = undefined;
+     const gr = try group(ck, try name(&buf, "{s}{s}", .{ prefix, mod }), n, k);
+     const st = cuda.exl3.strides(k, n, gr.halves, false);
+@@ -176,7 +182,7 @@ fn smallBf16(s: *Sink, ck: *core.Checkpoint, prefix: []const u8, mod: []const u8
+ }
+ 
+ /// The router as bf16 [experts + 1][hidden]: the gate's rows, then shared_expert_gate's (both stored f16).
+-fn router(s: *Sink, ck: *core.Checkpoint, prefix: []const u8) !u64 {
++pub fn router(s: anytype, ck: *core.Checkpoint, prefix: []const u8) !u64 {
+     const g = s.e.g;
+     const rows = try s.e.gpa.alloc(u16, (g.experts + 1) * g.hidden);
+     defer s.e.gpa.free(rows);
+@@ -190,7 +196,7 @@ fn router(s: *Sink, ck: *core.Checkpoint, prefix: []const u8) !u64 {
+ 
+ /// A layer's experts for the grouped EXL3 kernels: per-expert trellis pointers (the shared expert last, index
+ /// `experts`), per-expert half-bit widths, and suh/svh stacked [E][k] / [E][n].
+-fn experts(s: *Sink, ck: *core.Checkpoint, p: []const u8) !cuda.experts.Layer {
++pub fn experts(s: anytype, ck: *core.Checkpoint, p: []const u8) !cuda.experts.Layer {
+     const g = s.e.g;
+     const gpa = s.e.gpa;
+     const count = g.experts + 1;
+@@ -291,13 +297,13 @@ fn all(s: *Sink, ck: *core.Checkpoint) !void {
+ 
+ /// The arena bytes the weights take (the scratch is added by the caller).
+ pub fn measure(e: *Engine, ck: *core.Checkpoint) !usize {
+-    var s: Sink = .{ .e = e, .measure = true };
++    var s: Sink = .{ .e = e, .owner = e, .measure = true };
+     try all(&s, ck);
+     return aligned(s.at) + 256;
+ }
+ 
+ pub fn load(e: *Engine, ck: *core.Checkpoint) !void {
+-    var s: Sink = .{ .e = e, .measure = false };
++    var s: Sink = .{ .e = e, .owner = e, .measure = false };
+     try all(&s, ck);
+     try e.stream.synchronize();
+ }
+diff --git a/zig/src/families/qwen3_5/cuda_mtp.zig b/zig/src/families/qwen3_5/cuda_mtp.zig
+index 580395e..d8d170d 100644
+--- a/zig/src/families/qwen3_5/cuda_mtp.zig
++++ b/zig/src/families/qwen3_5/cuda_mtp.zig
+@@ -115,6 +115,7 @@ pub const Mtp = struct {
+         inline for (@typeInfo(Ring).@"struct".field_names) |name| @field(d.ring_fns, name) = try d.dmod.function("tf_q35d_" ++ name);
+         d.w = try weights.load(gpa, io, e, dir);
+         errdefer d.w.deinit();
++        if (platform.c.getenv("TF_MTP_FCCHECK") != null) try d.fcCheck();
+         d.scratch = try DeviceBuffer.alloc(e.d, d.scratchBytes());
+         errdefer d.scratch.free();
+         try d.scratch.fill8(0, null);
+@@ -139,6 +140,48 @@ pub const Mtp = struct {
+         return d;
+     }
+ 
++    /// fc's two K halves against one K = 2 * hidden decode over the same stored trellis, on pseudo-random rows (TF_MTP_FCCHECK).
++    fn fcCheck(d: *Mtp) !void {
++        const e = d.e;
++        const h = e.g.hidden;
++        var full = d.w.fc_e.x3;
++        full.k = @intCast(2 * h);
++        const st = cuda.exl3.strides(2 * h, h, full.halves, false);
++        full.stride_k = st.k;
++        full.stride_nb = st.nb;
++        var x = try DeviceBuffer.alloc(e.d, 2 * h * 2);
++        defer x.free();
++        var out = try DeviceBuffer.alloc(e.d, 3 * h * 2);
++        defer out.free();
++        const xs = try d.gpa.alloc(u16, 2 * h);
++        defer d.gpa.free(xs);
++        var rng = std.Random.DefaultPrng.init(7);
++        for (xs) |*v| v.* = @intCast((@as(u32, @bitCast(rng.random().floatNorm(f32) * 0.5)) + 0x8000) >> 16);
++        try x.upload(0, std.mem.sliceAsBytes(xs));
++        const dn = &e.kit.?.dense;
++        try dn.decode(e.stream, full, x.ptr, .bf16, 1, out.ptr, .bf16);
++        try dn.decode(e.stream, d.w.fc_e.x3, x.ptr, .bf16, 1, out.ptr + h * 2, .bf16);
++        try dn.decode(e.stream, d.w.fc_h.x3, x.ptr + h * 2, .bf16, 1, out.ptr + 2 * h * 2, .bf16);
++        try e.stream.synchronize();
++        const r = try d.gpa.alloc(u16, 3 * h);
++        defer d.gpa.free(r);
++        try out.download(0, std.mem.sliceAsBytes(r));
++        const f = struct {
++            fn v(b: u16) f64 {
++                return @as(f32, @bitCast(@as(u32, b) << 16));
++            }
++        }.v;
++        var num: f64 = 0;
++        var den: f64 = 0;
++        for (0..h) |i| {
++            const a = f(r[i]);
++            const b = f(r[h + i]) + f(r[2 * h + i]);
++            num += (a - b) * (a - b);
++            den += a * a;
++        }
++        std.debug.print("[mtp fc check] rel err of halves vs K={d}: {e:.3} (ref rms {d:.4}) {s}\n", .{ 2 * h, @sqrt(num / den), @sqrt(den / @as(f64, @floatFromInt(h))), if (@sqrt(num / den) < 0.02) "PASS" else "FAIL" });
++    }
++
+     /// The drafter's tap: the target's last layer, whose residual the final norm then reads.
+     pub fn taps(d: *const Mtp) []const u32 {
+         return &d.tap;
+@@ -269,8 +312,8 @@ pub const Mtp = struct {
+         try e.embed(d.ids, d.emb, rows, 0);
+         try d.norm(d.emb, 0, w.norm_e, d.en, rows);
+         try d.norm(d.hin, 0, w.norm_h, d.hn, rows);
+-        try d.proj(.{ .a4 = w.fc_e }, d.en, d.h, rows);
+-        try d.proj(.{ .a4 = w.fc_h }, d.hn, d.r, rows);
++        try d.proj(w.fc_e, d.en, d.h, rows);
++        try d.proj(w.fc_h, d.hn, d.r, rows);
+         try d.norm(d.h, d.r, w.input_norm, d.x, rows);
+         try d.proj(w.q, d.x, d.qraw, rows);
+         try d.proj(w.k, d.x, d.kraw, rows);
+@@ -470,9 +513,10 @@ pub const Mtp = struct {
+         return cast(p).taps();
+     }
+ 
++    /// TF_MTP_FORCE=1 drops the plain-round guard: always draft (to measure acceptance).
+     fn factsFn(p: *anyopaque) dr.Facts {
+         const d = cast(p);
+-        return .{ .depth = d.depth, .step_ms = d.step_ms, .prior = &prior, .plain_guard = true, .batched = false, .stream_bytes = d.ringBytes() + d.e.g.hidden * 2, .trees = d.trees, .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs] };
++        return .{ .depth = d.depth, .step_ms = d.step_ms, .prior = &prior, .plain_guard = platform.c.getenv("TF_MTP_FORCE") == null, .batched = false, .stream_bytes = d.ringBytes() + d.e.g.hidden * 2, .trees = d.trees, .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs] };
+     }
+ 
+     fn openFn(p: *anyopaque, s: *Stream) anyerror!void {
+diff --git a/zig/src/families/qwen3_5/cuda_mtp_weights.zig b/zig/src/families/qwen3_5/cuda_mtp_weights.zig
+index a669afc..14968d3 100644
+--- a/zig/src/families/qwen3_5/cuda_mtp_weights.zig
++++ b/zig/src/families/qwen3_5/cuda_mtp_weights.zig
+@@ -1,25 +1,23 @@
+-//! The Qwen3.6 MTP layer's weights (mtp-4bit.safetensors beside the checkpoint) onto the device, their own arena.
++//! The MTP layer's weights onto the device, their own arena: an EXL3 checkpoint's `mtp.*` tensors (HF names, trellis
++//! projections read in place like the main layers).
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const core = @import("core");
+ const engine = @import("cuda_engine.zig");
+ const geometry = @import("cuda_geometry.zig");
+-const weights = @import("cuda_weights.zig");
++const x3 = @import("cuda_exl3_weights.zig");
+ 
+-const Affine4 = cuda.qlinear.Affine4;
+ const Proj = engine.Proj;
+ const DeviceBuffer = cuda.DeviceBuffer;
+ const Engine = engine.Engine;
+ const aligned = engine.aligned;
+ const head_dim = geometry.head_dim;
+ 
+-pub const file = "mtp-4bit.safetensors";
+-
+ pub const Weights = struct {
+     arena: DeviceBuffer,
+     arena_at: usize = 0,
+-    fc_e: Affine4, // fc's halves: the embedding's inputs, then the hidden state's
+-    fc_h: Affine4,
++    fc_e: Proj, // fc's halves: the embedding's inputs, then the hidden state's
++    fc_h: Proj,
+     norm_e: u64,
+     norm_h: u64,
+     input_norm: u64,
+@@ -45,45 +43,82 @@ pub const Weights = struct {
+     }
+ };
+ 
+-/// Device bytes of everything `load` packs.
+-pub fn total(g: geometry.Geometry) usize {
+-    var t = 2 * weights.packedBytes(g.hidden, g.hidden, 4) + 7 * aligned(@max(g.hidden, head_dim) * 2);
+-    t += weights.packedBytes(2 * g.attnWidth(), g.hidden, 4) + 2 * weights.packedBytes(g.kv_heads * head_dim, g.hidden, 4) + weights.packedBytes(g.hidden, g.attnWidth(), 4);
+-    t += weights.routedBytes(g.experts, g.intermediate, g.hidden, 4); // the MTP layer's experts are 4-bit
+-    return t;
++const Sink = x3.SinkOf(Weights);
++
++/// fc as two halves over K = 2 * hidden: the stored trellis [K/16][N/16][W] splits by tile rows, so the second half starts
++/// `hidden/16` rows on and reads suh from `hidden` on; strides, svh and the mul1 marker are shared. The halves' outputs
++/// add in the norm that follows, as fc does over cat[embedding, hidden] (the transforms are linear).
++fn fcHalves(s: *Sink, kit: ?*x3.Kit, ck: *core.Checkpoint, h: usize) ![2]Proj {
++    const gr = try x3.group(ck, "mtp.fc", h, 2 * h);
++    const st = cuda.exl3.strides(h, h, gr.halves, false);
++    const trellis = try s.put(gr.trellis.bytes);
++    const suh = try s.put(gr.suh.bytes);
++    const svh = try s.put(gr.svh.bytes);
++    var out: [2]Proj = undefined;
++    for (&out, 0..) |*o, i| {
++        const w: cuda.exl3.Weight = .{
++            .trellis = trellis + i * (h / 16) * st.k * 4,
++            .suh = suh + i * h * 2,
++            .svh = svh,
++            .k = @intCast(h),
++            .n = @intCast(h),
++            .halves = gr.halves,
++            .codebook = .mul1,
++            .stride_k = st.k,
++            .stride_nb = st.nb,
++        };
++        if (kit) |x| try x.dense.reserve(w);
++        o.* = .{ .x3 = w };
++    }
++    return out;
+ }
+ 
+-/// The largest tensor `load` stages, as stored: fc's whole rows, an attention projection or an expert table.
+-fn stageBytes(g: geometry.Geometry) usize {
+-    const raw = weights.rawBytes;
+-    return @max(@max(raw(g.hidden, 2 * g.hidden, 4), raw(2 * g.attnWidth(), g.hidden, 4)), @max(raw(g.experts * g.intermediate, g.hidden, 4), raw(g.experts * g.hidden, g.intermediate, 4)));
++fn all(s: *Sink, w: *Weights, ck: *core.Checkpoint) !void {
++    const g = s.e.g;
++    const kit = s.e.kit;
++    const p = "mtp.layers.0.";
++    const fc = try fcHalves(s, kit, ck, g.hidden);
++    const norm_e = try x3.norm1(s, ck, "mtp.pre_fc_norm_embedding.weight", .{}, g.hidden);
++    const norm_h = try x3.norm1(s, ck, "mtp.pre_fc_norm_hidden.weight", .{}, g.hidden);
++    const norm = try x3.norm1(s, ck, "mtp.norm.weight", .{}, g.hidden);
++    const input_norm = try x3.norm1(s, ck, "{s}input_layernorm.weight", .{p}, g.hidden);
++    const post_norm = try x3.norm1(s, ck, "{s}post_attention_layernorm.weight", .{p}, g.hidden);
++    const q_norm = try x3.norm1(s, ck, "{s}self_attn.q_norm.weight", .{p}, head_dim);
++    const k_norm = try x3.norm1(s, ck, "{s}self_attn.k_norm.weight", .{p}, head_dim);
++    const q = try x3.dense(s, kit, ck, p, "self_attn.q_proj", 2 * g.attnWidth(), g.hidden);
++    const k = try x3.dense(s, kit, ck, p, "self_attn.k_proj", g.kv_heads * head_dim, g.hidden);
++    const v = try x3.dense(s, kit, ck, p, "self_attn.v_proj", g.kv_heads * head_dim, g.hidden);
++    const o = try x3.dense(s, kit, ck, p, "self_attn.o_proj", g.hidden, g.attnWidth());
++    const router = try x3.router(s, ck, p);
++    const experts = try x3.experts(s, ck, p);
++    if (s.measure) return;
++    w.fc_e = fc[0];
++    w.fc_h = fc[1];
++    w.norm_e = norm_e;
++    w.norm_h = norm_h;
++    w.norm = norm;
++    w.input_norm = input_norm;
++    w.post_norm = post_norm;
++    w.q_norm = q_norm;
++    w.k_norm = k_norm;
++    w.q = q;
++    w.k = k;
++    w.v = v;
++    w.o = o;
++    w.mlp = .{ .moe = .{ .router = router, .experts = experts } };
+ }
+ 
+ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8) !Weights {
+-    const g = e.g;
+-    var ck: core.Checkpoint = .{ .gpa = gpa, .io = io };
++    var ck = try core.Checkpoint.openModelPrefix(gpa, io, dir, "mtp.");
+     defer ck.close();
+-    try ck.add(dir, file);
+-    var w: Weights = .{ .arena = try DeviceBuffer.alloc(e.d, total(g)), .fc_e = undefined, .fc_h = undefined, .norm_e = 0, .norm_h = 0, .input_norm = 0, .post_norm = 0, .q_norm = 0, .k_norm = 0, .norm = 0, .q = undefined, .k = undefined, .v = undefined, .o = undefined, .mlp = undefined };
++    var w: Weights = .{ .arena = undefined, .fc_e = undefined, .fc_h = undefined, .norm_e = 0, .norm_h = 0, .input_norm = 0, .post_norm = 0, .q_norm = 0, .k_norm = 0, .norm = 0, .q = undefined, .k = undefined, .v = undefined, .o = undefined, .mlp = undefined };
++    var m: Sink = .{ .e = e, .owner = &w, .measure = true };
++    try all(&m, &w, &ck);
++    w.arena = try DeviceBuffer.alloc(e.d, aligned(m.at) + 256);
+     errdefer w.arena.free();
+     try w.arena.fill8(0, null);
+-    var stage = try DeviceBuffer.alloc(e.d, stageBytes(g)); // the load's staging, freed once the layer is packed
+-    defer stage.free();
+-    const m = "language_model.mtp.";
+-    const p = "language_model.mtp.layers.0.";
+-    w.fc_e = try weights.linearSlice(e, &w, &ck, &stage, m, "fc", g.hidden, 2 * g.hidden, 0, g.hidden);
+-    w.fc_h = try weights.linearSlice(e, &w, &ck, &stage, m, "fc", g.hidden, 2 * g.hidden, g.hidden, g.hidden);
+-    w.norm_e = try weights.tensor(&w, &ck, "{s}pre_fc_norm_embedding.weight", .{m}, .bf16, &.{g.hidden});
+-    w.norm_h = try weights.tensor(&w, &ck, "{s}pre_fc_norm_hidden.weight", .{m}, .bf16, &.{g.hidden});
+-    w.norm = try weights.tensor(&w, &ck, "{s}norm.weight", .{m}, .bf16, &.{g.hidden});
+-    w.input_norm = try weights.tensor(&w, &ck, "{s}input_layernorm.weight", .{p}, .bf16, &.{g.hidden});
+-    w.post_norm = try weights.tensor(&w, &ck, "{s}post_attention_layernorm.weight", .{p}, .bf16, &.{g.hidden});
+-    w.q_norm = try weights.tensor(&w, &ck, "{s}self_attn.q_norm.weight", .{p}, .bf16, &.{head_dim});
+-    w.k_norm = try weights.tensor(&w, &ck, "{s}self_attn.k_norm.weight", .{p}, .bf16, &.{head_dim});
+-    w.q = try weights.linear(e, &w, &ck, &stage, p, "self_attn.q_proj", 2 * g.attnWidth(), g.hidden, 4);
+-    w.k = try weights.linear(e, &w, &ck, &stage, p, "self_attn.k_proj", g.kv_heads * head_dim, g.hidden, 4);
+-    w.v = try weights.linear(e, &w, &ck, &stage, p, "self_attn.v_proj", g.kv_heads * head_dim, g.hidden, 4);
+-    w.o = try weights.linear(e, &w, &ck, &stage, p, "self_attn.o_proj", g.hidden, g.attnWidth(), 4);
+-    w.mlp = try weights.routed(e, &w, &ck, &stage, p, 4);
++    var s: Sink = .{ .e = e, .owner = &w, .measure = false };
++    try all(&s, &w, &ck);
++    try e.stream.synchronize();
+     return w;
+ }
+diff --git a/zig/src/families/qwen3_5/cuda_native_moe.zig b/zig/src/families/qwen3_5/cuda_native_moe.zig
+index 5d0f4b0..b7ee822 100644
+--- a/zig/src/families/qwen3_5/cuda_native_moe.zig
++++ b/zig/src/families/qwen3_5/cuda_native_moe.zig
+@@ -6,7 +6,7 @@ pub const formats = native.formats;
+ pub const default_context = native.default_context;
+ pub const max_segments = native.max_segments;
+ pub const prompt_rows = native.prompt_rows;
+-/// --drafter names the checkpoint's own directory: its MTP layer (mtp-4bit.safetensors) drafts chains.
++/// --drafter names the checkpoint's own directory: its MTP layer drafts chains (an EXL3 checkpoint's `mtp.*` tensors).
+ pub const takes_drafter = true;
+ pub const Options = native.Options;
+ pub const open = native.open;

@@ -1,0 +1,183 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mia <mia.ailab1@gmail.com>
+Date: Wed, 21 Oct 2026 09:06:22 +0300
+Subject: [PATCH] qwen35 verify-window router and plan
+
+---
+ zig/kernels/cuda/exl3_experts.cu | 94 ++++++++++++++++++++++----------
+ zig/kernels/cuda/moe.cu          | 18 +++---
+ zig/src/cuda/moe.zig             |  2 +-
+ 3 files changed, 76 insertions(+), 38 deletions(-)
+
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index 882fcd2..6352371 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -634,14 +634,29 @@ extern "C" __global__ void tf_exl3_plan_rotate(const PlanStage a) {
+     if (e == a.skip) return;
+     const int lane = threadIdx.x;
+     const half* su = (mat ? a.su1 : a.su0) + (size_t)e * a.k + blk * 128 + 4 * lane;
+-    for (int j = 0; j < count; ++j) {
+-        const int p = a.members[first + j], row = a.slots ? p / a.slots : p;
+-        const __nv_bfloat16* x = a.x + (size_t)row * a.stride + blk * 128 + 4 * lane;
+-        float v[4];
+-        for (int q = 0; q < 4; ++q) v[q] = __bfloat162float(x[q]) * __half2float(su[q]);
+-        tf_exl3::fwht128(v, lane);
+-        half* out = (mat ? a.x1 : a.x0) + (size_t)p * a.k + blk * 128 + 4 * lane;
+-        for (int q = 0; q < 4; ++q) out[q] = __float2half_rn(v[q] * tf_exl3::HAD_SCALE);
++    float sv[4];
++    for (int q = 0; q < 4; ++q) sv[q] = __half2float(su[q]);
++    // the members' rows load four at a time (a window's item has up to 16); each row's transform is its own
++    for (int j0 = 0; j0 < count; j0 += 4) {
++        float v[4][4];
++        int pj[4];
++#pragma unroll
++        for (int u = 0; u < 4; ++u) {
++            if (j0 + u < count) {
++                const int p = a.members[first + j0 + u], row = a.slots ? p / a.slots : p;
++                pj[u] = p;
++                const __nv_bfloat16* x = a.x + (size_t)row * a.stride + blk * 128 + 4 * lane;
++                for (int q = 0; q < 4; ++q) v[u][q] = __bfloat162float(x[q]) * sv[q];
++            }
++        }
++#pragma unroll
++        for (int u = 0; u < 4; ++u) {
++            if (j0 + u < count) {
++                tf_exl3::fwht128(v[u], lane);
++                half* out = (mat ? a.x1 : a.x0) + (size_t)pj[u] * a.k + blk * 128 + 4 * lane;
++                for (int q = 0; q < 4; ++q) out[q] = __float2half_rn(v[u][q] * tf_exl3::HAD_SCALE);
++            }
++        }
+     }
+ }
+ 
+@@ -652,29 +667,50 @@ extern "C" __global__ void tf_exl3_plan_finish(const PlanStage a) {
+     const int e = a.items[3 * it], first = a.items[3 * it + 1], count = a.items[3 * it + 2];
+     if (e == a.skip) return;
+     const int n = blk * 128 + 4 * lane;
+-    for (int j = 0; j < count; ++j) {
+-        const int p = a.members[first + j];
+-        float g[4] = {}, u[4] = {};
+-        for (int s = 0; s < a.sk; ++s)
+-            for (int q = 0; q < 4; ++q) {
+-                g[q] += a.z[((size_t)s * a.p + p) * a.n + n + q];
+-                if (a.epi == 2) u[q] += a.z[((size_t)(a.sk + s) * a.p + p) * a.n + n + q];
++    // the members' split sums load four at a time (a window's item has up to 16); each member's epilogue is its own
++    constexpr int U = 4;
++    for (int j0 = 0; j0 < count; j0 += U) {
++        float g[U][4], u[U][4];
++        int pj[U];
++#pragma unroll
++        for (int m = 0; m < U; ++m) {
++#pragma unroll
++            for (int q = 0; q < 4; ++q) g[m][q] = u[m][q] = 0.f;
++            pj[m] = j0 + m < count ? a.members[first + j0 + m] : 0;
++        }
++        for (int s = 0; s < a.sk; ++s) {
++#pragma unroll
++            for (int m = 0; m < U; ++m) {
++                if (j0 + m < count) {
++#pragma unroll
++                    for (int q = 0; q < 4; ++q) {
++                        g[m][q] += a.z[((size_t)s * a.p + pj[m]) * a.n + n + q];
++                        if (a.epi == 2) u[m][q] += a.z[((size_t)(a.sk + s) * a.p + pj[m]) * a.n + n + q];
++                    }
++                }
+             }
+-        tf_exl3::fwht128(g, lane);
+-        if (a.epi == 2) tf_exl3::fwht128(u, lane);
+-        for (int q = 0; q < 4; ++q) {
+-            float v = g[q] * tf_exl3::HAD_SCALE * __half2float(a.sv0[(size_t)e * a.n + n + q]);
+-            if (a.epi == 2) {
+-                float up = u[q] * tf_exl3::HAD_SCALE * __half2float(a.sv1[(size_t)e * a.n + n + q]);
+-                if (a.act_mode == 0) { v = tf_exl3::bf16r(v); up = tf_exl3::bf16r(up); }
+-                if (a.limit > 0) { v = tf_exl3::upTo(v, a.limit); up = tf_exl3::within(up, a.limit); }
+-                v = v / (1.f + expf(-v));
+-                if (a.act_mode == 0) v = tf_exl3::bf16r(v);
+-                v *= up;
++        }
++#pragma unroll
++        for (int m = 0; m < U; ++m) {
++            if (j0 + m < count) {
++                const int p = pj[m];
++                tf_exl3::fwht128(g[m], lane);
++                if (a.epi == 2) tf_exl3::fwht128(u[m], lane);
++                for (int q = 0; q < 4; ++q) {
++                    float v = g[m][q] * tf_exl3::HAD_SCALE * __half2float(a.sv0[(size_t)e * a.n + n + q]);
++                    if (a.epi == 2) {
++                        float up = u[m][q] * tf_exl3::HAD_SCALE * __half2float(a.sv1[(size_t)e * a.n + n + q]);
++                        if (a.act_mode == 0) { v = tf_exl3::bf16r(v); up = tf_exl3::bf16r(up); }
++                        if (a.limit > 0) { v = tf_exl3::upTo(v, a.limit); up = tf_exl3::within(up, a.limit); }
++                        v = v / (1.f + expf(-v));
++                        if (a.act_mode == 0) v = tf_exl3::bf16r(v);
++                        v *= up;
++                    }
++                    const size_t at = (size_t)p * a.n + n + q;
++                    if (a.epi == 0) reinterpret_cast<float*>(a.out)[at] = v;
++                    else reinterpret_cast<__nv_bfloat16*>(a.out)[at] = __float2bfloat16_rn(v);
++                }
+             }
+-            const size_t at = (size_t)p * a.n + n + q;
+-            if (a.epi == 0) reinterpret_cast<float*>(a.out)[at] = v;
+-            else reinterpret_cast<__nv_bfloat16*>(a.out)[at] = __float2bfloat16_rn(v);
+         }
+     }
+ }
+diff --git a/zig/kernels/cuda/moe.cu b/zig/kernels/cuda/moe.cu
+index aefd1be..1940e20 100644
+--- a/zig/kernels/cuda/moe.cu
++++ b/zig/kernels/cuda/moe.cu
+@@ -107,19 +107,21 @@ extern "C" __global__ void __launch_bounds__(128) tf_moe_router_rows(const __nv_
+                                                                        const __nv_bfloat16* __restrict__ W, float* __restrict__ OUT,
+                                                                        int R, int D, int E) {
+     tf_pdl_begin();
+-    const int e = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
++    // grid (E / 4, rows / 4): a block takes 4 experts and 4 rows; each (row, expert) sum is the same lane-striped chain and
++    // shuffle tree whatever the grouping
++    const int e = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31, r0 = blockIdx.y * 4;
+     if (e >= E) return;
+-    float acc[16];
++    float acc[4];
+ #pragma unroll
+-    for (int r = 0; r < 16; ++r) acc[r] = 0.0f;
++    for (int r = 0; r < 4; ++r) acc[r] = 0.0f;
+     const __nv_bfloat16* w = W + static_cast<int64_t>(e) * D;
+     for (int k = lane * 8; k < D; k += 256) {
+         uint4 wv = *reinterpret_cast<const uint4*>(w + k);
+         const __nv_bfloat16* wp = reinterpret_cast<const __nv_bfloat16*>(&wv);
+ #pragma unroll
+-        for (int r = 0; r < 16; ++r) {
+-            if (r < R) {
+-                uint4 xv = *reinterpret_cast<const uint4*>(X + static_cast<int64_t>(r) * x_stride + k);
++        for (int r = 0; r < 4; ++r) {
++            if (r0 + r < R) {
++                uint4 xv = *reinterpret_cast<const uint4*>(X + static_cast<int64_t>(r0 + r) * x_stride + k);
+                 const __nv_bfloat16* xp = reinterpret_cast<const __nv_bfloat16*>(&xv);
+ #pragma unroll
+                 for (int j = 0; j < 8; ++j) acc[r] = __fmaf_rn(bf(xp[j]), bf(wp[j]), acc[r]);
+@@ -127,10 +129,10 @@ extern "C" __global__ void __launch_bounds__(128) tf_moe_router_rows(const __nv_
+         }
+     }
+ #pragma unroll
+-    for (int r = 0; r < 16; ++r) {
++    for (int r = 0; r < 4; ++r) {
+ #pragma unroll
+         for (int off = 16; off > 0; off >>= 1) acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], off);
+-        if (lane == 0 && r < R) OUT[static_cast<int64_t>(r) * E + e] = acc[r];
++        if (lane == 0 && r0 + r < R) OUT[static_cast<int64_t>(r0 + r) * E + e] = acc[r];
+     }
+ }
+ 
+diff --git a/zig/src/cuda/moe.zig b/zig/src/cuda/moe.zig
+index 77ed214..0c26e63 100644
+--- a/zig/src/cuda/moe.zig
++++ b/zig/src/cuda/moe.zig
+@@ -36,7 +36,7 @@ pub const Fns = struct {
+         a.add(logits);
+         for ([_]usize{ rows, dims, count }) |v| a.add(int(v));
+         if (f.fast_rows and rows <= 16 and dims % 256 == 0 and x_stride % 8 == 0 and x % 16 == 0 and w % 16 == 0) {
+-            const wide: launch_.Config = .{ .grid = .{ .x = @intCast((count + 3) / 4), .y = 1, .z = 1 }, .block = .{ .x = 128 } };
++            const wide: launch_.Config = .{ .grid = .{ .x = @intCast((count + 3) / 4), .y = @intCast((rows + 3) / 4), .z = 1 }, .block = .{ .x = 128 } };
+             return launch_.launch(f.router_rows_fn, wide, s, &a);
+         }
+         if (f.tiled and rows > 16 and dims % 64 == 0 and x_stride % 8 == 0 and x % 16 == 0 and w % 16 == 0) {

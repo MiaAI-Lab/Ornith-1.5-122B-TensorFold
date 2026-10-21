@@ -1,0 +1,137 @@
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 25315ca..2dbeb10 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -61,6 +61,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "qwen35_keep", .flags = &.{"-O3"} }, // ours: a verified window's kept path applied to its stream's state
+     .{ .name = "qwen_vision", .flags = &.{ "-O3", "--fmad=false" } }, // ours: the Qwen3.5 vision tower's glue and attention
+     .{ .name = "qwen35_kv8", .flags = &.{"-O3"} }, // ours: --kv-cache fp8's e4m3 attention rows for the Qwen3.5 hybrids
++    .{ .name = "qwen35_bf16", .flags = &.{"-O3"} }, // ours: bf16 token rows and small bf16 dense projections (qwen3_5/cuda_bf16.zig)
+     .{ .name = "nemotron_norms", .flags = glue }, // ours, each with a host reference (glue_ref.zig): Nemotron's glue
+     .{ .name = "nemotron_route", .flags = glue },
+     .{ .name = "nemotron_mamba", .flags = glue },
+diff --git a/zig/kernels/cuda/qwen35_bf16.cu b/zig/kernels/cuda/qwen35_bf16.cu
+new file mode 100644
+index 0000000..7399289
+--- /dev/null
++++ b/zig/kernels/cuda/qwen35_bf16.cu
+@@ -0,0 +1,51 @@
++// Qwen3.5 bf16-weight pieces: token rows of a bf16 table and small dense projections (GDN in_proj_a / in_proj_b).
++
++#include <cuda_bf16.h>
++#include <stdint.h>
++
++// P (device counts, as qwen35.cu's): rows at or past P[2] are padding and left untouched; P may be null.
++__device__ __forceinline__ bool q35b_past_rows(const int* P, int m) { return P != nullptr && m >= P[2]; }
++
++// out[r] = table[ids[r]] (D wide, bit copy). Grid: rows; any D (16-byte vectors when D % 8 == 0 and the pointers align).
++extern "C" __global__ void __launch_bounds__(256) tf_q35_embed_bf16(const int* __restrict__ ids, const __nv_bfloat16* __restrict__ table,
++                                                                     __nv_bfloat16* __restrict__ out, int D, const int* __restrict__ P) {
++    if (q35b_past_rows(P, blockIdx.x)) return;
++    const size_t id = (size_t)ids[blockIdx.x];
++    const __nv_bfloat16* src = table + id * (size_t)D;
++    __nv_bfloat16* dst = out + (size_t)blockIdx.x * D;
++    if ((D & 7) == 0 && ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 15) == 0) {
++        for (int i = threadIdx.x; i < D / 8; i += blockDim.x) reinterpret_cast<uint4*>(dst)[i] = reinterpret_cast<const uint4*>(src)[i];
++    } else {
++        for (int i = threadIdx.x; i < D; i += blockDim.x) dst[i] = src[i];
++    }
++}
++
++// y[r][j] = bf16(sum_k x[r][k] * W[j][k]); k % 8 == 0, x and W 16-byte aligned. Grid (n, rows), 256 threads.
++// One block reduces one output with a fixed order: thread t adds chunks t, t + 256, ... (8 products each, in order),
++// then a fixed shuffle tree over the warp and the 8 warp sums in order. Nothing depends on the row count.
++extern "C" __global__ void __launch_bounds__(256) tf_q35_dense_bf16(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
++                                                                     __nv_bfloat16* __restrict__ Y, int n, int k) {
++    __shared__ float red[8];
++    const int j = blockIdx.x;
++    const size_t r = blockIdx.y;
++    const uint4* x = reinterpret_cast<const uint4*>(X + r * (size_t)k);
++    const uint4* w = reinterpret_cast<const uint4*>(W + (size_t)j * k);
++    float acc = 0.0f;
++    for (int c = threadIdx.x; c < k / 8; c += 256) {
++        const uint4 xv = x[c], wv = w[c];
++        const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xv);
++        const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wv);
++#pragma unroll
++        for (int e = 0; e < 8; e++) acc = __fmaf_rn(__bfloat162float(xb[e]), __bfloat162float(wb[e]), acc);
++    }
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
++    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        float s = red[0];
++#pragma unroll
++        for (int i = 1; i < 8; i++) s += red[i];
++        Y[r * (size_t)n + j] = __float2bfloat16_rn(s);
++    }
++}
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 80c5f50..3a3d1d3 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -45,6 +45,7 @@ pub const qwen35_draft: []const u8 = if (available) &Blob("fatbin_qwen35_draft")
+ pub const qwen35_keep: []const u8 = if (available) &Blob("fatbin_qwen35_keep").bytes else &.{};
+ pub const qwen_vision: []const u8 = if (available) &Blob("fatbin_qwen_vision").bytes else &.{};
+ pub const qwen35_kv8: []const u8 = if (available) &Blob("fatbin_qwen35_kv8").bytes else &.{};
++pub const qwen35_bf16: []const u8 = if (available) &Blob("fatbin_qwen35_bf16").bytes else &.{};
+ pub const qmmf: []const u8 = if (available) &Blob("fatbin_qmmf").bytes else &.{};
+ pub const prompt16: []const u8 = if (available) &Blob("fatbin_prompt16").bytes else &.{};
+ pub const tree_attention: []const u8 = if (available) &Blob("fatbin_tree_attention").bytes else &.{};
+diff --git a/zig/src/families/qwen3_5/cuda_bf16.zig b/zig/src/families/qwen3_5/cuda_bf16.zig
+new file mode 100644
+index 0000000..c5665ae
+--- /dev/null
++++ b/zig/src/families/qwen3_5/cuda_bf16.zig
+@@ -0,0 +1,50 @@
++//! qwen35_bf16.cu: bf16 token rows and small bf16 dense projections (GDN in_proj_a / in_proj_b) for the Qwen CUDA engine.
++const std = @import("std");
++const cuda = @import("cuda");
++
++const threads = 256;
++
++pub const Kernels = struct {
++    mod: cuda.Module,
++    embed_fn: cuda.Function,
++    dense_fn: cuda.Function,
++
++    pub fn resolve(mod: cuda.Module) !Kernels {
++        return .{ .mod = mod, .embed_fn = try mod.function("tf_q35_embed_bf16"), .dense_fn = try mod.function("tf_q35_dense_bf16") };
++    }
++
++    /// Load the embedded module (owned: call unload) and resolve its functions.
++    pub fn load(d: *const cuda.Driver) !Kernels {
++        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
++        var mod = try cuda.Module.load(d, cuda.kernels.qwen35_bf16);
++        errdefer mod.unload();
++        return resolve(mod);
++    }
++
++    pub fn unload(k: *Kernels) void {
++        k.mod.unload();
++    }
++
++    /// out[r] = table[ids[r]] for r < rows (device ids i32 [rows], table bf16 [vocab][hidden], out bf16 [rows][hidden]).
++    /// params: device counts as tf_q35_embed's (rows at or past params[2] are skipped), or 0 for none.
++    pub fn embedRows(k: *const Kernels, s: cuda.Stream, ids: u64, table: u64, out: u64, rows: usize, hidden: usize, params: u64) !void {
++        if (rows == 0) return;
++        if (hidden == 0 or hidden > std.math.maxInt(i32) or rows > std.math.maxInt(u32)) return error.RowShape;
++        var a: cuda.launch.Args = .{};
++        for ([_]u64{ ids, table, out }) |v| a.add(v);
++        a.add(@as(i32, @intCast(hidden)));
++        a.add(params);
++        try cuda.launch.launch(k.embed_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = threads } }, s, &a);
++    }
++
++    /// out[rows][n] = x[rows][k] @ w[n][k]^T, bf16 in and out, fp32 sums in a fixed order whatever `rows` is (rows <= 128).
++    /// k % 8 == 0; x and w 16-byte aligned.
++    pub fn denseRows(kn: *const Kernels, s: cuda.Stream, x: u64, w: u64, out: u64, rows: usize, n: usize, k: usize) !void {
++        if (rows == 0 or n == 0) return;
++        if (rows > 128 or k == 0 or k % 8 != 0 or k > std.math.maxInt(i32) or n > std.math.maxInt(i32) or x % 16 != 0 or w % 16 != 0) return error.RowShape;
++        var a: cuda.launch.Args = .{};
++        for ([_]u64{ x, w, out }) |v| a.add(v);
++        for ([_]usize{ n, k }) |v| a.add(@as(i32, @intCast(v)));
++        try cuda.launch.launch(kn.dense_fn, .{ .grid = .{ .x = @intCast(n), .y = @intCast(rows), .z = 1 }, .block = .{ .x = threads } }, s, &a);
++    }
++};

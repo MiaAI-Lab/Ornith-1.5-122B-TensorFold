@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mia <mia.ailab1@gmail.com>
+Date: Wed, 21 Oct 2026 02:55:38 +0300
+Subject: [PATCH] qwen35 position table stride follows max_rows (vision with 2048-row chunks)
+
+---
+ zig/kernels/cuda/qwen35.cuh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/kernels/cuda/qwen35.cuh b/zig/kernels/cuda/qwen35.cuh
+index 728614b..e0a8799 100644
+--- a/zig/kernels/cuda/qwen35.cuh
++++ b/zig/kernels/cuda/qwen35.cuh
+@@ -12,7 +12,7 @@ constexpr int HD = 256;   // attention head width
+ constexpr int MAXQ = 32;  // attention query heads at most
+ constexpr int MAXW = 64;  // a window's rows at most (the log's rows a stream)
+ constexpr int MAXCH = 64; // attention chunks a row at most (cuda_engine.zig's max_chunks)
+-constexpr int MAXR = 128;  // a forward's rows at most (cuda_engine.zig's max_rows): an image chunk's position rows
++constexpr int MAXR = 2048; // a forward's rows at most (cuda_engine.zig's max_rows, which strides the position table in cuda_engine.zig): an image chunk's position rows
+ 
+ // The model's widths: hidden, linear key heads, linear value heads, attention query and key/value heads, linear layers.
+ struct Geo {

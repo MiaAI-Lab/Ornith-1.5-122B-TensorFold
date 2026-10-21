@@ -1,0 +1,322 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mia <mia.ailab1@gmail.com>
+Date: Wed, 21 Oct 2026 09:06:12 +0300
+Subject: [PATCH] qwen35 batched decode attention
+
+---
+ zig/kernels/cuda/qwen35.cu                | 119 ++++++++++++++++++++++
+ zig/kernels/cuda/qwen35.cuh               |   2 +
+ zig/kernels/cuda/qwen35_kv8.cu            | 109 ++++++++++++++++++++
+ zig/src/families/qwen3_5/cuda_engine.zig  |   2 +-
+ zig/src/families/qwen3_5/cuda_forward.zig |   3 +-
+ zig/src/families/qwen3_5/cuda_layers.zig  |   3 +-
+ 6 files changed, 235 insertions(+), 3 deletions(-)
+
+diff --git a/zig/kernels/cuda/qwen35.cu b/zig/kernels/cuda/qwen35.cu
+index c39ca35..58de9dc 100644
+--- a/zig/kernels/cuda/qwen35.cu
++++ b/zig/kernels/cuda/qwen35.cu
+@@ -567,6 +567,125 @@ extern "C" __global__ void tf_q35_attn_partial(Geo geo, const __nv_bfloat16* __r
+     for (int i = 0; i < DPL; i++) PO[slot * HD + lane * DPL + i] = o[i];
+ }
+ 
++// Causal attention in chunks of chunk_keys(the row's keys), a warp a query head; partials by (row, head, chunk).
++//
++// The block's warps (the query heads of one key head) all walk the same keys, so the block loads them once: ATT_U keys' key
++// and value rows reach shared memory as coalesced 16-byte chunks over all threads (one batch ahead in registers), and each
++// warp takes its head's scores for the batch together (their dot products and warp sums do not depend on the running
++// maximum, so they interleave) before the unchanged in-order online softmax over the batch. Every score, maximum, sum and
++// output is computed with the operations and the order of the one-key-at-a-time walk this replaces: the same bits.
++extern "C" __global__ void __launch_bounds__(512, ATT_MB) tf_q35_attn_partial_b(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
++                                                 const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
++                                                 const int* __restrict__ P, float scale,
++                                                 float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
++    constexpr int DPL = HD / 32;
++    constexpr int U = ATT_U;
++    const int QH = geo.qh, KVH = geo.kvh;
++    const int lane = threadIdx.x & 31, g = threadIdx.x >> 5;
++    const int c = blockIdx.x, h = blockIdx.y;
++    if (c >= MAXCH || past_rows(P, blockIdx.z)) return;     // uniform across the block
++    const size_t m = blockIdx.z;
++    const int qh = h * (QH / KVH) + g;
++    const Seg sg = segs[rowseg[m]];
++    const Ancestor anc = rowanc[m];
++    // chunks cut at logical positions (a window key's: the stream's length plus its ancestors), as a step's are
++    const int keys = sg.len + rows_seen(anc), ck = chunk_keys(keys);
++    const int k0 = c * ck, k1 = min(k0 + ck, keys);
++    const size_t slot = (m * QH + qh) * MAXCH + c;
++    if (k0 >= k1) {
++        if (lane == 0) {
++            PM[slot] = -INFINITY;
++            PL[slot] = 0.0f;
++        }
++        return;
++    }
++    const __nv_bfloat16* K = reinterpret_cast<const __nv_bfloat16*>(sg.kv) + (size_t)layer * 2 * KVH * sg.cap * HD;
++    const __nv_bfloat16* V = K + (size_t)KVH * sg.cap * HD;
++    __shared__ __align__(16) uint4 kv_sh[2][2][U][32];       // [buffer][key or value][key of the batch][16-byte chunk of the row]
++    float q[DPL], o[DPL];
++#pragma unroll
++    for (int i = 0; i < DPL; i++) {
++        q[i] = bf(Q[(m * QH + qh) * HD + lane * DPL + i]);
++        o[i] = 0.0f;
++    }
++    float mx = -INFINITY, l = 0.0f;
++    // this thread's two chunks of a batch: (key or value, key of the batch, chunk) = the thread, then the thread + 512 / 32
++    const int tu = threadIdx.x >> 5, tcc = threadIdx.x & 31;
++    constexpr int THREADS_PER_ROWS = 32 * U;                 // chunks of one side (keys or values) of a batch
++    uint4 R[2 * U * 32 / 512 > 0 ? 2 * U * 32 / 512 : 1];
++    static_assert(2 * U * 32 % 512 == 0, "a batch is a whole number of chunks a thread");
++    auto load = [&](int t0) {
++        const int n = min(U, k1 - t0);
++#pragma unroll
++        for (int j = 0; j < 2 * U * 32 / 512; j++) {
++            const int cidx = threadIdx.x + 512 * j;
++            const int side = cidx / THREADS_PER_ROWS, u = (cidx % THREADS_PER_ROWS) / 32, cc = cidx % 32;
++            if (u < n) {
++                const int t = t0 + u;
++                const int pos = t < sg.len ? t : sg.len + seen_row(anc, t - sg.len);
++                const __nv_bfloat16* base = side ? V : K;
++                R[j] = *reinterpret_cast<const uint4*>(base + ((size_t)h * sg.cap + pos) * HD + cc * 8);
++            }
++        }
++    };
++    auto store = [&](int t0, int buf) {
++        const int n = min(U, k1 - t0);
++#pragma unroll
++        for (int j = 0; j < 2 * U * 32 / 512; j++) {
++            const int cidx = threadIdx.x + 512 * j;
++            const int side = cidx / THREADS_PER_ROWS, u = (cidx % THREADS_PER_ROWS) / 32, cc = cidx % 32;
++            if (u < n) kv_sh[buf][side][u][cc] = R[j];
++        }
++    };
++    (void)tu; (void)tcc;
++    load(k0);
++    store(k0, 0);
++    __syncthreads();
++    for (int t0 = k0, b = 0; t0 < k1; t0 += U, ++b) {
++        const int n = min(U, k1 - t0);
++        if (t0 + U < k1) load(t0 + U);
++        // the batch's scores: dots on this lane's 8 dims, then the 32 lanes' butterfly sums for all keys together
++        float sc[U];
++#pragma unroll
++        for (int u = 0; u < U; u++) {
++            float dot = 0.0f;
++            if (u < n) {
++                const uint4 kw = kv_sh[b & 1][0][u][lane];
++                const __nv_bfloat16* kb = reinterpret_cast<const __nv_bfloat16*>(&kw);
++#pragma unroll
++                for (int i = 0; i < DPL; i++) dot = fmaf(q[i], bf(kb[i]), dot);
++            }
++            sc[u] = dot;
++        }
++#pragma unroll
++        for (int d = 16; d > 0; d >>= 1)
++#pragma unroll
++            for (int u = 0; u < U; u++) sc[u] = sc[u] + __shfl_xor_sync(0xffffffffu, sc[u], d);
++#pragma unroll
++        for (int u = 0; u < U; u++) {
++            if (u < n) {
++                const float s = sc[u] * scale;
++                const float mn = fmaxf(mx, s);
++                const float a = __expf(mx - mn), bb = __expf(s - mn);
++                l = l * a + bb;
++                const uint4 vw = kv_sh[b & 1][1][u][lane];
++                const __nv_bfloat16* vb = reinterpret_cast<const __nv_bfloat16*>(&vw);
++#pragma unroll
++                for (int i = 0; i < DPL; i++) o[i] = fmaf(bb, bf(vb[i]), o[i] * a);
++                mx = mn;
++            }
++        }
++        if (t0 + U < k1) store(t0 + U, (b + 1) & 1);
++        __syncthreads();
++    }
++    if (lane == 0) {
++        PM[slot] = mx;
++        PL[slot] = l;
++    }
++#pragma unroll
++    for (int i = 0; i < DPL; i++) PO[slot * HD + lane * DPL + i] = o[i];
++}
++
+ // Prompt-chunk attention on tensor cores (qwen35_attn_prompt.cuh): one pass over the keys, the final bf16 rows, no partials.
+ extern "C" __global__ void __launch_bounds__(PW * 32, 2) tf_q35_attn_prompt(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
+                                                                              const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+diff --git a/zig/kernels/cuda/qwen35.cuh b/zig/kernels/cuda/qwen35.cuh
+index f376129..ad31063 100644
+--- a/zig/kernels/cuda/qwen35.cuh
++++ b/zig/kernels/cuda/qwen35.cuh
+@@ -11,6 +11,8 @@ constexpr int TAPS = 4;   // causal convolution taps
+ constexpr int HD = 256;   // attention head width
+ constexpr int MAXQ = 32;  // attention query heads at most
+ constexpr int MAXW = 64;  // a window's rows at most (the log's rows a stream)
++constexpr int ATT_U = 16; // keys a decode attention chunk's walk takes at once (one chunk of 16 bytes a thread: 512 threads)
++constexpr int ATT_MB = 2; // blocks a multiprocessor holds of it (64 registers)
+ constexpr int MAXCH = 64; // attention chunks a row at most (cuda_engine.zig's max_chunks)
+ constexpr int MAXR = 8192; // a forward's rows at most: must equal cuda_engine.zig's max_rows, the stride of the staged position table (an image chunk's t, h, w rows)
+ 
+diff --git a/zig/kernels/cuda/qwen35_kv8.cu b/zig/kernels/cuda/qwen35_kv8.cu
+index ce0a712..dbf5d00 100644
+--- a/zig/kernels/cuda/qwen35_kv8.cu
++++ b/zig/kernels/cuda/qwen35_kv8.cu
+@@ -124,6 +124,115 @@ extern "C" __global__ void tf_q35_attn_partial8(Geo geo, const __nv_bfloat16* __
+     for (int i = 0; i < DPL; i++) PO[slot * HD + lane * DPL + i] = o[i];
+ }
+ 
++// tf_q35_attn_partial over e4m3 rows: a key's dot taken on its codes, then scaled; a value's weight carries its scale.
++// Batched through shared memory like tf_q35_attn_partial (same operations, same order, same bits).
++extern "C" __global__ void __launch_bounds__(512, ATT_MB) tf_q35_attn_partial8_b(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
++                                                  const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
++                                                  const int* __restrict__ P, float scale,
++                                                  float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
++    constexpr int DPL = HD / 32;
++    constexpr int U = ATT_U;
++    constexpr int CPR = HD / 16;                                  // 16-byte chunks of an e4m3 row
++    static_assert(2 * U * CPR == 512, "a batch is one chunk a thread");
++    const int QH = geo.qh, KVH = geo.kvh;
++    const int lane = threadIdx.x & 31, g = threadIdx.x >> 5;
++    const int c = blockIdx.x, h = blockIdx.y;
++    if (c >= MAXCH || past_rows(P, blockIdx.z)) return;
++    const size_t m = blockIdx.z;
++    const int qh = h * (QH / KVH) + g;
++    const Seg sg = segs[rowseg[m]];
++    const Ancestor anc = rowanc[m];
++    const int keys = sg.len + rows_seen(anc), ck = chunk_keys(keys);
++    const int k0 = c * ck, k1 = min(k0 + ck, keys);
++    const size_t slot = (m * QH + qh) * MAXCH + c;
++    if (k0 >= k1) {
++        if (lane == 0) {
++            PM[slot] = -INFINITY;
++            PL[slot] = 0.0f;
++        }
++        return;
++    }
++    const unsigned char* K = layer_at(sg, layer, KVH);
++    const unsigned char* V = K + (size_t)KVH * sg.cap * HD;
++    const float* KS = reinterpret_cast<const float*>(V + (size_t)KVH * sg.cap * HD);
++    const float* VS = KS + (size_t)KVH * sg.cap;
++    __shared__ __align__(16) uint4 kv_sh[2][2][U][CPR];       // [buffer][keys or values][key of the batch][chunk of the row]
++    __shared__ float sc_sh[2][2][U];                          // the rows' scales
++    float q[DPL], o[DPL];
++#pragma unroll
++    for (int i = 0; i < DPL; i++) {
++        q[i] = bf(Q[(m * QH + qh) * HD + lane * DPL + i]);
++        o[i] = 0.0f;
++    }
++    float mx = -INFINITY, l = 0.0f;
++    uint4 R = make_uint4(0, 0, 0, 0);
++    float RS = 0.0f;
++    const int side = threadIdx.x / (U * CPR), u_ld = (threadIdx.x % (U * CPR)) / CPR, cc = threadIdx.x % CPR;
++    auto load = [&](int t0) {
++        const int n = min(U, k1 - t0);
++        if (u_ld < n) {
++            const int t = t0 + u_ld;
++            const int pos = t < sg.len ? t : sg.len + seen_row(anc, t - sg.len);
++            const size_t row = (size_t)h * sg.cap + pos;
++            R = *reinterpret_cast<const uint4*>((side ? V : K) + row * HD + cc * 16);
++            if (cc == 0) RS = (side ? VS : KS)[row];
++        }
++    };
++    auto store = [&](int t0, int buf) {
++        const int n = min(U, k1 - t0);
++        if (u_ld < n) {
++            kv_sh[buf][side][u_ld][cc] = R;
++            if (cc == 0) sc_sh[buf][side][u_ld] = RS;
++        }
++    };
++    load(k0);
++    store(k0, 0);
++    __syncthreads();
++    for (int t0 = k0, b = 0; t0 < k1; t0 += U, ++b) {
++        const int n = min(U, k1 - t0);
++        if (t0 + U < k1) load(t0 + U);
++        float sc[U];
++#pragma unroll
++        for (int u = 0; u < U; u++) {
++            float dot = 0.0f;
++            if (u < n) {
++                float kf[DPL];
++                widen8(reinterpret_cast<const uint2*>(&kv_sh[b & 1][0][u][0])[lane], kf);
++#pragma unroll
++                for (int i = 0; i < DPL; i++) dot = fmaf(q[i], kf[i], dot);
++            }
++            sc[u] = dot;
++        }
++#pragma unroll
++        for (int d = 16; d > 0; d >>= 1)
++#pragma unroll
++            for (int u = 0; u < U; u++) sc[u] = sc[u] + __shfl_xor_sync(0xffffffffu, sc[u], d);
++#pragma unroll
++        for (int u = 0; u < U; u++) {
++            if (u < n) {
++                float vf[DPL];
++                const float s = sc[u] * sc_sh[b & 1][0][u] * scale;
++                const float mn = fmaxf(mx, s);
++                const float a = __expf(mx - mn), bb = __expf(s - mn);
++                l = l * a + bb;
++                widen8(reinterpret_cast<const uint2*>(&kv_sh[b & 1][1][u][0])[lane], vf);
++                const float bv = bb * sc_sh[b & 1][1][u];
++#pragma unroll
++                for (int i = 0; i < DPL; i++) o[i] = fmaf(bv, vf[i], o[i] * a);
++                mx = mn;
++            }
++        }
++        if (t0 + U < k1) store(t0 + U, (b + 1) & 1);
++        __syncthreads();
++    }
++    if (lane == 0) {
++        PM[slot] = mx;
++        PL[slot] = l;
++    }
++#pragma unroll
++    for (int i = 0; i < DPL; i++) PO[slot * HD + lane * DPL + i] = o[i];
++}
++
+ // tf_q35_attn_prompt over e4m3 rows; dynamic shared memory of PROMPT_SMEM8 bytes.
+ extern "C" __global__ void __launch_bounds__(PW * 32, 2) tf_q35_attn_prompt8(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
+                                                                               const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+diff --git a/zig/src/families/qwen3_5/cuda_engine.zig b/zig/src/families/qwen3_5/cuda_engine.zig
+index 6ec4dbe..cdd56d0 100644
+--- a/zig/src/families/qwen3_5/cuda_engine.zig
++++ b/zig/src/families/qwen3_5/cuda_engine.zig
+@@ -249,7 +249,7 @@ pub const Engine = struct {
+         e.moe.fast_rows = std.c.getenv("TF_QWEN_ROUTER_TILE") == null;
+         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
+         inline for (@typeInfo(Keeps).@"struct".field_names) |name| @field(e.keeps, name) = try e.mods[6].function("tf_q35k_" ++ name);
+-        e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .attn_prompt = try e.mods[9].function("tf_q35_attn_prompt8"), .compact = try e.mods[9].function("tf_q35k_compact8") };
++        e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .attn_partial_b = try e.mods[9].function("tf_q35_attn_partial8_b"), .attn_prompt = try e.mods[9].function("tf_q35_attn_prompt8"), .compact = try e.mods[9].function("tf_q35k_compact8") };
+         try e.fp8.attn_prompt.allowDynamicShared(prompt_smem8);
+         e.old_attn = std.c.getenv("TF_QWEN_OLD_ATTN") != null;
+         e.old_gdn = std.c.getenv("TF_QWEN_OLD_GDN") != null;
+diff --git a/zig/src/families/qwen3_5/cuda_forward.zig b/zig/src/families/qwen3_5/cuda_forward.zig
+index 534f039..a599b48 100644
+--- a/zig/src/families/qwen3_5/cuda_forward.zig
++++ b/zig/src/families/qwen3_5/cuda_forward.zig
+@@ -100,7 +100,8 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
+                     if (e.kv8) try e.runShared(e.fp8.attn_prompt, grid, .{ attn_prompt_rows * 32, 1, 1 }, E.prompt_smem8, args) else try e.run(e.fns.attn_prompt, grid, .{ attn_prompt_rows * 32, 1, 1 }, args);
+                 } else {
+                     if (total > E.attn_rows) return error.TooManyRows; // the partials hold attn_rows rows
+-                    try e.run(if (e.kv8) e.fp8.attn_partial else e.fns.attn_partial, .{ max_chunks, g.kv_heads, total }, .{ 32 * group, 1, 1 }, .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po });
++                    const batched = group == 16 and head_dim == 256;
++                    try e.run(if (e.kv8) (if (batched) e.fp8.attn_partial_b else e.fp8.attn_partial) else (if (batched) e.fns.attn_partial_b else e.fns.attn_partial), .{ max_chunks, g.kv_heads, total }, .{ 32 * group, 1, 1 }, .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po });
+                     try e.run(e.fns.attn_merge, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.y });
+                 }
+                 try e.run(e.fns.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params });
+diff --git a/zig/src/families/qwen3_5/cuda_layers.zig b/zig/src/families/qwen3_5/cuda_layers.zig
+index 4c08bea..1618cc8 100644
+--- a/zig/src/families/qwen3_5/cuda_layers.zig
++++ b/zig/src/families/qwen3_5/cuda_layers.zig
+@@ -62,6 +62,7 @@ pub const Fns = struct {
+     head_norm: cuda.Function,
+     rope: cuda.Function,
+     attn_partial: cuda.Function,
++    attn_partial_b: cuda.Function, // the same sums batched through shared memory (16 query heads to a key head, 256 wide)
+     attn_prompt: cuda.Function, // tensor-core prompt-chunk attention (rows > 16), the final rows with no partials
+     attn_merge: cuda.Function,
+     attn_gate: cuda.Function,
+@@ -77,4 +78,4 @@ pub const Fns = struct {
+ pub const Keeps = struct { apply: cuda.Function, conv: cuda.Function, compact: cuda.Function };
+ 
+ /// qwen35_kv8.cu's kernels: the cache writes, attention reads and keep's moves over e4m3 rows (--kv-cache fp8).
+-pub const Kv8 = struct { rope: cuda.Function, attn_partial: cuda.Function, attn_prompt: cuda.Function, compact: cuda.Function };
++pub const Kv8 = struct { rope: cuda.Function, attn_partial: cuda.Function, attn_partial_b: cuda.Function, attn_prompt: cuda.Function, compact: cuda.Function };

@@ -1,0 +1,339 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mia <mia.ailab1@gmail.com>
+Date: Wed, 21 Oct 2026 08:18:38 +0300
+Subject: [PATCH] qwen35 prompt passes of 8192 rows and mid-pass kept states
+
+---
+ zig/kernels/cuda/qwen35_gdn_chunk.cuh     | 25 ++++++-
+ zig/src/families/qwen3_5/cuda_cache.zig   |  2 +
+ zig/src/families/qwen3_5/cuda_engine.zig  | 12 +++-
+ zig/src/families/qwen3_5/cuda_forward.zig |  6 ++
+ zig/src/families/qwen3_5/cuda_layers.zig  |  1 +
+ zig/src/families/qwen3_5/cuda_native.zig  | 80 ++++++++++++++++++-----
+ zig/src/families/qwen3_5/cuda_reuse.zig   |  8 ++-
+ zig/src/families/qwen3_5/cuda_round.zig   |  2 +-
+ 8 files changed, 112 insertions(+), 24 deletions(-)
+
+diff --git a/zig/kernels/cuda/qwen35_gdn_chunk.cuh b/zig/kernels/cuda/qwen35_gdn_chunk.cuh
+index 248c1b3..e76ff49 100644
+--- a/zig/kernels/cuda/qwen35_gdn_chunk.cuh
++++ b/zig/kernels/cuda/qwen35_gdn_chunk.cuh
+@@ -140,7 +140,8 @@ constexpr int GKP = DK + 8;    // tile row stride (bf16)
+ constexpr int GSCAN_SMEM = 2 * GC * GKP * 2 + GTB * 4 + 8 * 64 * 4 + 4 * GC * 4;
+ extern "C" __global__ void __launch_bounds__(GNW * 32) tf_q35_gdn_cscan(Geo geo, const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+                                                                              const __nv_bfloat16* __restrict__ v, const Seg* __restrict__ segs, int layer,
+-                                                                             __nv_bfloat16* __restrict__ y, const float* __restrict__ raw, const float* __restrict__ aux) {
++                                                                             __nv_bfloat16* __restrict__ y, const float* __restrict__ raw, const float* __restrict__ aux,
++                                                                             int snap_blk) {
+     const int NK = geo.nk, NV = geo.nv;
+     const int hv = blockIdx.x, hk = hv / (NV / NK);
+     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gq = lane >> 2, tq = lane & 3;
+@@ -184,6 +185,15 @@ extern "C" __global__ void __launch_bounds__(GNW * 32) tf_q35_gdn_cscan(Geo geo,
+         }
+     }
+     for (int blk = 0; blk < nblk; blk++) {
++        if (blk == snap_blk) {
++            // the recurrence after the first blk * GC rows, into Seg.before (the prompt cache's state at that row: cuda_reuse.zig)
++            float* st = reinterpret_cast<float*>(sg.before) + (size_t)layer * geo.rec() + ((size_t)hv * DK + d0) * DK;
++#pragma unroll
++            for (int n = 0; n < 16; n++) {
++                *reinterpret_cast<float2*>(st + (size_t)gq * DK + 8 * n + 2 * tq) = make_float2(S[n][0], S[n][1]);
++                *reinterpret_cast<float2*>(st + (size_t)(gq + 8) * DK + 8 * n + 2 * tq) = make_float2(S[n][2], S[n][3]);
++            }
++        }
+         const int rel = blk * GC;
+         const int n = min(GC, sg.rows - rel), r0 = sg.row0 + rel;
+         const float* rq = raw + ((size_t)blk * NK + hk) * GRAW;  // Q K^T blocks, then K K^T blocks
+@@ -366,6 +376,19 @@ extern "C" __global__ void __launch_bounds__(GNW * 32) tf_q35_gdn_cscan(Geo geo,
+     }
+ }
+ 
++// The conv tail after the first `mid` rows of the pass (its last TAPS - 1 input rows), into Seg.before beside tf_q35_gdn_cscan's
++// recurrence: what tf_q35_conv_commit leaves in Seg.conv after a pass of `mid` rows. Grid (ceil(C / 256)), one stream.
++extern "C" __global__ void __launch_bounds__(256) tf_q35_conv_snap(Geo geo, const __nv_bfloat16* __restrict__ QKV, const Seg* __restrict__ segs,
++                                                                     int layer, int mid) {
++    const int C = geo.conv();
++    const int c = blockIdx.x * blockDim.x + threadIdx.x;
++    if (c >= C) return;
++    const Seg sg = segs[0];
++    __nv_bfloat16* out = reinterpret_cast<__nv_bfloat16*>(sg.before + geo.nl * geo.rec() * sizeof(float)) + (size_t)layer * geo.conv_rows();
++    for (int r = 0; r < TAPS - 1; r++) out[(size_t)r * C + c] = QKV[(size_t)(sg.row0 + mid - (TAPS - 1) + r) * C + c];
++}
++
++
+ // TF_GDN_DIFF: mode 0 saves the stream's layer recurrence to buf, 1 restores it, 2 compares it with buf (and y0 with y1,
+ // rows x nv x DK) into stats: [max |dy|, sum dy^2, sum y0^2, max |dS|, sum dS^2, sum S^2]. Grid-stride, 1-D.
+ extern "C" __global__ void __launch_bounds__(256) tf_q35_gdn_cdiff(Geo geo, const Seg* __restrict__ segs, int layer, int mode, float* __restrict__ buf,
+diff --git a/zig/src/families/qwen3_5/cuda_cache.zig b/zig/src/families/qwen3_5/cuda_cache.zig
+index 925d818..b737c0c 100644
+--- a/zig/src/families/qwen3_5/cuda_cache.zig
++++ b/zig/src/families/qwen3_5/cuda_cache.zig
+@@ -32,6 +32,8 @@ pub const Cache = struct {
+     logits: []u16,
+     /// The newest verify window, until its path is kept: where it started, its rows.
+     last: ?struct { start: usize, rows: usize } = null,
++    /// The row of a mid-pass state kept in `before` (Engine.mid_rows) while the host saves it; 0 otherwise.
++    mid_at: usize = 0,
+     /// An image prompt's rotary shift (get_rope_index's rope_delta): rows after its prompt rotate at position + delta.
+     pub fn init(gpa: std.mem.Allocator, e: *const Engine, cap: usize) !Cache {
+         var state = try DeviceBuffer.alloc(e.d, e.g.stateBytes());
+diff --git a/zig/src/families/qwen3_5/cuda_engine.zig b/zig/src/families/qwen3_5/cuda_engine.zig
+index 748d477..6ec4dbe 100644
+--- a/zig/src/families/qwen3_5/cuda_engine.zig
++++ b/zig/src/families/qwen3_5/cuda_engine.zig
+@@ -20,7 +20,7 @@ const DeviceBuffer = cuda.DeviceBuffer;
+ const head_dim = geometry.head_dim;
+ 
+ /// Rows of one forward at most: a prompt chunk, or a shared round's windows.
+-pub const max_rows = 4096;
++pub const max_rows = 8192;
+ /// Rows the scalar attention's partials hold (decode, verify windows, short pieces, and chunks the tensor-core kernel does not take).
+ pub const attn_rows = 2048;
+ /// tf_q35_gdn_cscan's dynamic shared memory (qwen35_gdn_chunk.cuh's layouts), and the rows a block takes.
+@@ -98,6 +98,9 @@ pub const Engine = struct {
+     old_gdn: bool = false, // TF_QWEN_OLD_GDN: prompt chunks take the one-row-a-warp gated delta scan
+     old_attn: bool = false, // TF_QWEN_OLD_ATTN: prompt chunks take the scalar partial/merge attention
+     gdn_seq: bool = false, // TF_GDN_SEQ: prompt chunks take the sequential gated delta scan (not the chunkwise one)
++    /// A prompt pass's row (a multiple of gdn_block, inside the pass) whose state the pass also keeps, in Cache.before, for the prompt cache
++    /// (cuda_reuse.zig): the chunkwise scan stores its recurrence there and conv_snap the tail; set by the host, cleared by forward.
++    mid_rows: usize = 0,
+     gdn_diff: bool = false, // TF_GDN_DIFF: run both scans on every prompt layer, print their difference, keep the sequential result
+     gdn_scr: u64 = 0, // the chunkwise scan's raw per-block products and per-block decays
+     gdn_aux: u64 = 0,
+@@ -252,6 +255,7 @@ pub const Engine = struct {
+         e.old_gdn = std.c.getenv("TF_QWEN_OLD_GDN") != null;
+         e.gdn_seq = std.c.getenv("TF_GDN_SEQ") != null;
+         e.gdn_diff = std.c.getenv("TF_GDN_DIFF") != null;
++        e.mid_rows = 0;
+         try e.fns.gdn_cscan.allowDynamicShared(gdn_scan_smem);
+         e.layers = try gpa.alloc(Layer, g.layers);
+         errdefer gpa.free(e.layers);
+@@ -490,9 +494,11 @@ pub const Engine = struct {
+ 
+     /// One forward over `parts`' windows, with every input admitted before an unkept verify is settled.
+     pub fn forward(e: *Engine, parts: []const Part, ids: []const u32, keep: Keep) !void {
++        defer e.mid_rows = 0;
+         try e.admit(parts, ids, keep);
+         const g = e.g;
+         const total = ids.len;
++        if (e.mid_rows != 0 and !(keep == .last and parts.len == 1 and @import("cuda_forward.zig").midReady(e, total, e.mid_rows))) return error.MidUnavailable;
+         const record = keep != .last;
+         const heads: usize = if (record) total else 1;
+         // the prompt GEMM only for prompt chunks: a window's rows keep the bits of one-row steps
+@@ -623,7 +629,8 @@ pub const Engine = struct {
+         const segs = e.tables.ptr + segs_at;
+         const blocks = (total + gdn_block - 1) / gdn_block;
+         try e.run(e.fns.gdn_cmat, .{ blocks, e.g.k_heads, 1 }, .{ 128, 1, 1 }, .{ e.geo, e.q, e.k, e.g_, e.beta, segs, e.gdn_scr, e.gdn_aux });
+-        try e.runShared(e.fns.gdn_cscan, .{ e.g.v_heads, geometry.dk / (16 * gdn_warps), 1 }, .{ 32 * gdn_warps, 1, 1 }, gdn_scan_smem, .{ e.geo, e.q, e.k, e.v, segs, layer, y, e.gdn_scr, e.gdn_aux });
++        const snap_blk: c_int = if (e.mid_rows > 0) @intCast(e.mid_rows / gdn_block) else -1;
++        try e.runShared(e.fns.gdn_cscan, .{ e.g.v_heads, geometry.dk / (16 * gdn_warps), 1 }, .{ 32 * gdn_warps, 1, 1 }, gdn_scan_smem, .{ e.geo, e.q, e.k, e.v, segs, layer, y, e.gdn_scr, e.gdn_aux, snap_blk });
+     }
+ 
+     /// TF_GDN_DIFF: both scans from the same recurrence, the difference printed; the sequential results stay.
+@@ -654,6 +661,7 @@ pub const Engine = struct {
+     pub const body = @import("cuda_forward.zig").body;
+ 
+     pub const routedRows = routed.rows;
++    pub const midReady = @import("cuda_forward.zig").midReady;
+ 
+     /// Row `i`'s logits from the newest forward that kept logits.
+     pub fn rowLogits(e: *const Engine, i: usize) []const u16 {
+diff --git a/zig/src/families/qwen3_5/cuda_forward.zig b/zig/src/families/qwen3_5/cuda_forward.zig
+index 9369d86..534f039 100644
+--- a/zig/src/families/qwen3_5/cuda_forward.zig
++++ b/zig/src/families/qwen3_5/cuda_forward.zig
+@@ -31,6 +31,11 @@ fn chunkScan(e: *E.Engine, prompt: bool, record: bool, total: usize, nseg: usize
+     return prompt and !record and nseg == 1 and total >= gdn_chunk_min and !e.gdn_seq and e.g.v_heads % e.g.k_heads == 0 and geometry.dk == 128;
+ }
+ 
++/// Whether a prompt pass of `rows` rows can keep the state at row `mid` as it goes: the chunkwise scan runs, mid is one of its block boundaries.
++pub fn midReady(e: *E.Engine, rows: usize, mid: usize) bool {
++    return mid > 0 and mid < rows and mid % E.gdn_block == 0 and mid >= 3 and chunkScan(e, true, false, rows, 1) and !e.gdn_diff and e.learning == null and !e.pockets.any();
++}
++
+ pub fn promptMoe(prompt: bool, rows: usize) bool {
+     return prompt and rows > prompt_moe_cutoff;
+ }
+@@ -70,6 +75,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
+                 if (e.learning) |k| try k.delta(i, e.qkv, e.z, e.b, e.a, total);
+                 try e.run(e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
+                 try e.run(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
++                if (e.mid_rows > 0) try e.run(e.fns.conv_snap, .{ (g.convWidth() + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, layer, @as(c_int, @intCast(e.mid_rows)) });
+                 if (chunkScan(e, prompt, record, total, nseg)) {
+                     if (e.gdn_diff) try e.chunkScanDiff(total, layer) else try e.chunkScan(total, layer, e.y);
+                 } else if (prompt and total > prompt_moe_cutoff and !e.old_gdn) try e.promptScan(nseg, layer) else try e.deltaScan(record, shape.slots, nseg, layer);
+diff --git a/zig/src/families/qwen3_5/cuda_layers.zig b/zig/src/families/qwen3_5/cuda_layers.zig
+index ef9d65f..4c08bea 100644
+--- a/zig/src/families/qwen3_5/cuda_layers.zig
++++ b/zig/src/families/qwen3_5/cuda_layers.zig
+@@ -47,6 +47,7 @@ pub const Fns = struct {
+     sums: cuda.Function,
+     gdn_pre: cuda.Function,
+     conv_commit: cuda.Function,
++    conv_snap: cuda.Function, // a prompt pass's conv tail at its mid row, beside gdn_cscan's recurrence there (Seg.before)
+     gdn_chain: cuda.Function,
+     gdn_cmat: cuda.Function, // chunkwise prompt scan (qwen35_gdn_chunk.cuh): the state-free products, then the sequential half
+     gdn_cscan: cuda.Function,
+diff --git a/zig/src/families/qwen3_5/cuda_native.zig b/zig/src/families/qwen3_5/cuda_native.zig
+index 326dd99..c13b303 100644
+--- a/zig/src/families/qwen3_5/cuda_native.zig
++++ b/zig/src/families/qwen3_5/cuda_native.zig
+@@ -33,7 +33,8 @@ pub const snap_restore = reuse.restore;
+ pub const snap_drop = reuse.drop;
+ pub const snap_host = true;
+ pub const snap_lookahead: u32 = 0;
+-pub const snap_grid: u32 = E.max_rows;
++/// Rows a prompt pass is cut at when no request chunk start comes first (a pass may be longer: one grid line inside it is kept as it goes).
++pub const snap_grid: u32 = 4096;
+ 
+ /// explain() words open refusals too (--vision on a checkpoint without a tower it reads).
+ pub const explains_open = true;
+@@ -181,9 +182,11 @@ pub fn explain(ctx: ?*anyopaque, err: anyerror) ?[]const u8 {
+     };
+ }
+ 
+-/// Where a prompt pass from `at` cuts its chunk: max_rows rows on, or the request's next chunk start before that.
+-fn nextCut(len: usize, chunks: []const u32, at: usize) usize {
+-    var end: usize = @min(len, at + E.max_rows);
++/// Where a prompt pass from `at` cuts its chunk: max_rows rows on, at most one snapshot grid line inside it (the pass keeps the
++/// state there as it goes: Engine.mid_rows), or the request's next chunk start before that.
++fn nextCut(len: usize, chunks: []const u32, at: usize, real: bool) usize {
++    // `real`: every grid line is a cut (image prompts)
++    var end: usize = @min(len, @min(at + E.max_rows, (at / snap_grid + @as(usize, if (real) 1 else 2)) * snap_grid));
+     for (chunks) |boundary| if (boundary > at) {
+         end = @min(end, boundary);
+         break;
+@@ -191,22 +194,54 @@ fn nextCut(len: usize, chunks: []const u32, at: usize) usize {
+     return end;
+ }
+ 
+-/// Whether a cold pass over `len` rows (from 0) cuts a chunk at `pos`.
+-fn coldCut(len: usize, chunks: []const u32, pos: usize) bool {
++/// Whether the grid line `pos`, inside the pass [at, end), is one of its scan's block boundaries (so a pass resumed there computes the rest
++/// as the pass through does).
++fn midLine(pos: usize, at: usize, end: usize) bool {
++    return pos > at and pos < end and pos % snap_grid == 0 and (pos - at) % E.gdn_block == 0;
++}
++
++/// Rows a pass resumed at a grid line needs to run as the rows inside the cold pass did: the prompt kernels (scan, attention, experts)
++/// take over from the decode ones past 16 rows, the chunkwise scan from 32 (cuda_forward.zig).
++const resume_min: usize = 32;
++
++/// Whether a cold pass over `len` rows (from 0) cuts a chunk at `pos`, or passes a grid line there that a pass keeps as it goes.
++fn coldCut(len: usize, chunks: []const u32, pos: usize, real: bool) bool {
+     var at: usize = 0;
+-    while (at < pos and at < len) at = nextCut(len, chunks, at);
++    while (at < len) {
++        if (pos == at) return true;
++        const end = nextCut(len, chunks, at, real);
++        if (pos < end) return midLine(pos, at, end) and len - pos >= resume_min;
++        at = end;
++    }
+     return at == pos;
+ }
+ 
+-test "a pass resumes only where a cold pass cuts: every max_rows rows from 0 or from the request's chunk starts" {
+-    const len = 8 * E.max_rows - 24;
+-    try std.testing.expect(coldCut(len, &.{}, E.max_rows * 3));
+-    try std.testing.expect(!coldCut(len, &.{}, E.max_rows * 3 + 1));
+-    try std.testing.expect(coldCut(len, &.{200}, 200));
+-    try std.testing.expect(coldCut(len, &.{200}, 200 + E.max_rows));
+-    try std.testing.expect(!coldCut(len, &.{200}, 2 * E.max_rows)); // cut at 200 instead, then 200 + max_rows
+-    try std.testing.expectEqual(@as(usize, 200), nextCut(len, &.{200}, 0));
+-    try std.testing.expectEqual(@as(usize, 200 + E.max_rows), nextCut(len, &.{200}, 200));
++/// The first mark the store asked for inside the pass [at, end) that the pass keeps as it goes (0: none).
++fn midMark(marks: []const u32, at: usize, end: usize) usize {
++    for (marks) |m| if (midLine(m, at, end)) return m;
++    return 0;
++}
++
++test "a pass resumes only where a cold pass cuts or keeps a grid line: every max_rows rows or grid line from 0 or from the request's chunk starts" {
++    const long = 10 * E.max_rows;
++    try std.testing.expect(coldCut(long, &.{}, snap_grid * 3, false)); // a grid line, kept inside a pass or cut at
++    try std.testing.expect(!coldCut(long, &.{}, snap_grid * 3 + 1, false));
++    try std.testing.expect(!coldCut(snap_grid + 5, &.{}, snap_grid, false)); // 5 rows resumed there would take the decode kernels
++    try std.testing.expect(coldCut(snap_grid + resume_min, &.{}, snap_grid, false));
++    try std.testing.expect(coldCut(long, &.{200}, 200, false));
++    try std.testing.expect(!coldCut(long, &.{200}, snap_grid, false)); // the pass from 200 has blocks at 200 + 64 k: 4096 is not one
++    try std.testing.expect(coldCut(long, &.{256}, snap_grid, false)); // the pass from 256 has: 3840 = 60 blocks
++    try std.testing.expectEqual(@as(usize, 200), nextCut(long, &.{200}, 0, false));
++    // one grid line inside a pass at most
++    try std.testing.expectEqual(@as(usize, 2 * snap_grid), nextCut(long, &.{}, 0, false));
++    try std.testing.expectEqual(@as(usize, 2 * snap_grid), nextCut(long, &.{}, 100, false));
++    try std.testing.expectEqual(@as(usize, 3 * snap_grid), nextCut(long, &.{}, snap_grid, false));
++    try std.testing.expectEqual(@as(usize, 5000), nextCut(5000, &.{}, 0, false));
++    try std.testing.expectEqual(@as(usize, snap_grid), nextCut(long, &.{}, 0, true)); // image prompts cut at every grid line
++    try std.testing.expect(coldCut(long, &.{}, snap_grid, true));
++    try std.testing.expectEqual(@as(usize, snap_grid), midMark(&.{ 0, snap_grid }, 0, 5000));
++    try std.testing.expectEqual(@as(usize, 0), midMark(&.{snap_grid}, 0, snap_grid));
++    try std.testing.expectEqual(@as(usize, 0), midMark(&.{1000}, 0, 5000));
+ }
+ 
+ fn release(p: *anyopaque) void {
+@@ -320,7 +355,7 @@ const Lanes = struct {
+         var at: usize = 0;
+         stream.cached = 0;
+         if (stream.reuse.saved) |saved| {
+-            if (stream.reuse.at > 0 and stream.reuse.at < ids.len and coldCut(ids.len, stream.chunks, stream.reuse.at)) {
++            if (stream.reuse.at > 0 and stream.reuse.at < ids.len and coldCut(ids.len, stream.chunks, stream.reuse.at, images != null)) {
+                 if (reuse.restoreCache(self.e, cache, saved, seen)) {
+                     at = stream.reuse.at;
+                     stream.cached = stream.reuse.at;
+@@ -332,8 +367,17 @@ const Lanes = struct {
+         }
+         cache.untaught = stream.untaught;
+         while (at < ids.len) {
+-            const end = nextCut(ids.len, stream.chunks, at);
++            const end = nextCut(ids.len, stream.chunks, at, images != null);
++            // a mark the store asked for on a grid line inside this pass: the pass keeps the state there as it goes
++            var mid = midMark(stream.reuse.marks, at, end);
++            if (mid != 0 and (images != null or !self.e.midReady(end - at, mid - at))) mid = 0; // (image prompts keep to real cuts)
++            self.e.mid_rows = if (mid != 0) mid - at else 0;
+             try self.e.forward(&.{.{ .cache = cache, .rows = end - at, .images = if (images) |*im| im else null }}, ids[at..end], .last);
++            if (mid != 0) if (stream.reuse.hook) |k| {
++                cache.mid_at = mid;
++                defer cache.mid_at = 0;
++                k.at(k.ptr, stream, @intCast(mid));
++            };
+             at = end;
+             // a mark the store asked for, where this pass cut anyway: the lane host copies the state here
+             if (end < ids.len and std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(end)) != null) {
+diff --git a/zig/src/families/qwen3_5/cuda_reuse.zig b/zig/src/families/qwen3_5/cuda_reuse.zig
+index 8b7eb12..aa8eac8 100644
+--- a/zig/src/families/qwen3_5/cuda_reuse.zig
++++ b/zig/src/families/qwen3_5/cuda_reuse.zig
+@@ -117,7 +117,10 @@ pub fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
+ 
+ /// A host copy of `cache` at `at` rows, naming the prompt's images that start before it.
+ pub fn saveCache(e: *Engine, cache: *const Cache, at: usize, seen: []const Seen) !*Copy {
+-    if (cache.len != at or cache.last != null or at > cache.cap) return error.NotAtMark;
++    // a mid-pass mark: the pass ended further on, the state at `at` was kept in `before` (Engine.mid_rows), the rows before `at` are in kv
++    const mid = cache.mid_at != 0 and cache.mid_at == at and cache.len > at;
++    if (!mid and cache.len != at) return error.NotAtMark;
++    if (cache.last != null or at > cache.cap) return error.NotAtMark;
+     const l: Layout = .{ .g = e.g, .format = formatOf(e), .cap = cache.cap, .at = at };
+     var n: usize = 0;
+     for (seen) |im| n += @intFromBool(im.at < at);
+@@ -135,7 +138,8 @@ pub fn saveCache(e: *Engine, cache: *const Cache, at: usize, seen: []const Seen)
+     var off: usize = 0;
+     for (0..l.count()) |i| {
+         const p = l.piece(i);
+-        const dev = (if (p.kv) cache.kv.ptr else cache.state.ptr) + p.off;
++        const state_at = if (mid) (cache.before orelse return error.MissingQwenBefore).ptr else cache.state.ptr;
++        const dev = (if (p.kv) cache.kv.ptr else state_at) + p.off;
+         if (p.len > 0) try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(copy.host.bytes.ptr + off, dev, p.len, e.stream.handle), "cuMemcpyDtoHAsync");
+         off += p.len;
+     }
+diff --git a/zig/src/families/qwen3_5/cuda_round.zig b/zig/src/families/qwen3_5/cuda_round.zig
+index 6f1a59c..d1b5ada 100644
+--- a/zig/src/families/qwen3_5/cuda_round.zig
++++ b/zig/src/families/qwen3_5/cuda_round.zig
+@@ -4,7 +4,7 @@ const slots = @import("core").tree_slots;
+ const Seg = @import("cuda_cache.zig").Seg;
+ const Rule = @import("cuda").sample.Rule;
+ pub const Path = @import("cuda_cache.zig").Path;
+-pub const max_rows = 4096;
++pub const max_rows = 8192;
+ pub const max_segs = 128;
+ pub const most_verify = 128;
+ pub const most_window = 64;

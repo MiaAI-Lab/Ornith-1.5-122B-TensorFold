@@ -1,0 +1,207 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mia <mia.ailab1@gmail.com>
+Date: Wed, 21 Oct 2026 09:06:12 +0300
+Subject: [PATCH] qwen35 shared expert on a side stream
+
+---
+ zig/kernels/cuda/exl3_experts.cu              | 12 ++++++
+ zig/src/cuda/exl3_experts.zig                 |  2 +
+ zig/src/families/qwen3_5/cuda_engine.zig      | 12 ++++++
+ .../families/qwen3_5/cuda_exl3_weights.zig    |  5 +++
+ zig/src/families/qwen3_5/cuda_routed.zig      | 40 ++++++++++++++++++-
+ 5 files changed, 69 insertions(+), 2 deletions(-)
+
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index 5f14dc7..eb1bddf 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -593,6 +593,18 @@ struct PlanStage {
+     float limit;
+ };
+ 
++// The shared expert's own plan for a decode window of `rows` rows: one item (the expert, members 0 .., count rows) over the
++// pairs row * slots + slots - 1, in row order as the full plan lists them; run on a side stream before the router has picked.
++extern "C" __global__ void tf_exl3_shared_plan(int* items, int* counts, int* members, int rows, int slots, int expert) {
++    if (threadIdx.x < rows) members[threadIdx.x] = threadIdx.x * slots + slots - 1;
++    if (threadIdx.x == 0) {
++        items[0] = expert;
++        items[1] = 0;
++        items[2] = rows;
++        counts[0] = 1;
++    }
++}
++
+ extern "C" __global__ void tf_exl3_plan_rotate(const PlanStage a) {
+     const int it = blockIdx.x, blk = blockIdx.y, mat = blockIdx.z;
+     if (it >= a.counts[0]) return;
+diff --git a/zig/src/cuda/exl3_experts.zig b/zig/src/cuda/exl3_experts.zig
+index bb1b049..c8d85c0 100644
+--- a/zig/src/cuda/exl3_experts.zig
++++ b/zig/src/cuda/exl3_experts.zig
+@@ -120,6 +120,7 @@ pub const Experts = struct {
+     prompt: prompt.Kernels = undefined,
+     plan_rotate: Function = undefined,
+     plan_finish: Function = undefined,
++    shared_plan: Function = undefined,
+ 
+     pub fn load(d: *const Driver) !Experts {
+         if (!kernels.available) return error.BuiltWithoutKernels;
+@@ -135,6 +136,7 @@ pub const Experts = struct {
+         e.prompt = try prompt.Kernels.resolve(e.mod);
+         e.plan_rotate = try e.mod.function("tf_exl3_plan_rotate");
+         e.plan_finish = try e.mod.function("tf_exl3_plan_finish");
++        e.shared_plan = try e.mod.function("tf_exl3_shared_plan");
+         e.group = try e.mod.function("tf_exl3_group");
+         try e.group.allowDynamicShared(64 * 1024);
+         e.rot_in = try e.mod.function("tf_exl3_experts_rot_in");
+diff --git a/zig/src/families/qwen3_5/cuda_engine.zig b/zig/src/families/qwen3_5/cuda_engine.zig
+index cdd56d0..46d1d73 100644
+--- a/zig/src/families/qwen3_5/cuda_engine.zig
++++ b/zig/src/families/qwen3_5/cuda_engine.zig
+@@ -94,6 +94,9 @@ pub const Engine = struct {
+     g: Geometry,
+     geo: Geo,
+     stream: cuda.Stream,
++    side: cuda.Stream, // the shared expert's stream (forked from `stream` after the layer's norm, joined before the combine)
++    fork: cuda.Event,
++    join: cuda.Event,
+     mods: [16]cuda.Module,
+     old_gdn: bool = false, // TF_QWEN_OLD_GDN: prompt chunks take the one-row-a-warp gated delta scan
+     old_attn: bool = false, // TF_QWEN_OLD_ATTN: prompt chunks take the scalar partial/merge attention
+@@ -220,6 +223,12 @@ pub const Engine = struct {
+         e.features = 0;
+         e.stream = try cuda.Stream.init(d, true);
+         errdefer e.stream.deinit();
++        e.side = try cuda.Stream.init(d, true);
++        errdefer e.side.deinit();
++        e.fork = try cuda.Event.init(d, false);
++        errdefer e.fork.deinit();
++        e.join = try cuda.Event.init(d, false);
++        errdefer e.join.deinit();
+         var ck = try core.Checkpoint.openModel(gpa, io, dir);
+         defer ck.close();
+         // an EXL3 checkpoint's weights are sized by a dry run of its loader (trellis widths come from the tensors)
+@@ -297,6 +306,9 @@ pub const Engine = struct {
+     }
+ 
+     pub fn deinit(e: *Engine) void {
++        e.join.deinit();
++        e.fork.deinit();
++        e.side.deinit();
+         e.pockets.deinit();
+         if (e.kit) |k| k.deinit(e.gpa);
+         var it = e.graphs.valueIterator();
+diff --git a/zig/src/families/qwen3_5/cuda_exl3_weights.zig b/zig/src/families/qwen3_5/cuda_exl3_weights.zig
+index 83389fe..93b1c49 100644
+--- a/zig/src/families/qwen3_5/cuda_exl3_weights.zig
++++ b/zig/src/families/qwen3_5/cuda_exl3_weights.zig
+@@ -23,6 +23,7 @@ pub const Kit = struct {
+     dense: cuda.exl3.Dense,
+     experts: ex.Experts,
+     grouped: cuda.exl3_grouped.Grouped,
++    grouped_side: cuda.exl3_grouped.Grouped, // the shared expert's own scratch (it runs on a side stream beside `grouped`'s)
+     b16: b16.Kernels,
+ 
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, g: geometry.Geometry) !*Kit {
+@@ -30,6 +31,7 @@ pub const Kit = struct {
+         errdefer gpa.destroy(k);
+         k.dense = try cuda.exl3.Dense.load(d);
+         if (std.c.getenv("TF_QWEN_FUSED_PROMPT")) |v| routed.setFusedPrompt(v[0] != '0');
++        if (std.c.getenv("TF_QWEN_SIDE_SHARED")) |v| routed.setSideShared(v[0] != '0');
+         if (std.c.getenv("TF_QWEN_DENSE_TILES") == null or std.c.getenv("TF_QWEN_DENSE_TILES").?[0] != '0') k.dense.implementation = .tiles; // bf16 x/y, even halves, stored layout: Ornith's dense weights all qualify
+         errdefer k.dense.unload();
+         k.experts = try ex.Experts.load(d);
+@@ -46,11 +48,14 @@ pub const Kit = struct {
+         // the fused prompt kernels keep a chunk's rotated gate and up rows (fp16, pairs x hidden each) here too
+         const fused = 4 * engine.max_rows * g.slots() * g.hidden;
+         k.grouped.storage = try cuda.DeviceBuffer.alloc(d, @max(@max(up, down), fused));
++        k.grouped_side = .{ .d = d, .kernels = &k.experts };
++        k.grouped_side.storage = try cuda.DeviceBuffer.alloc(d, @max(up, down));
+         return k;
+     }
+ 
+     pub fn deinit(k: *Kit, gpa: std.mem.Allocator) void {
+         k.grouped.deinit();
++        k.grouped_side.deinit();
+         k.b16.unload();
+         k.experts.unload();
+         k.dense.unload();
+diff --git a/zig/src/families/qwen3_5/cuda_routed.zig b/zig/src/families/qwen3_5/cuda_routed.zig
+index db407a1..155cf68 100644
+--- a/zig/src/families/qwen3_5/cuda_routed.zig
++++ b/zig/src/families/qwen3_5/cuda_routed.zig
+@@ -4,6 +4,11 @@ const E = @import("cuda_engine.zig");
+ 
+ /// The fused mul1 prompt kernels (TF_QWEN_FUSED_PROMPT=0 falls back to the generic grouped path).
+ var fused_prompt: bool = true;
++/// The shared expert on a side stream (setSideShared(false) keeps it in the routed plan).
++var side_shared: bool = true;
++pub fn setSideShared(on: bool) void {
++    side_shared = on;
++}
+ pub fn setFusedPrompt(on: bool) void {
+     fused_prompt = on;
+ }
+@@ -20,6 +25,9 @@ pub const Scratch = struct {
+     hist: u64 = 0,
+     act: u64 = 0,
+     y: u64 = 0,
++    sh_items: u64 = 0, // the shared expert's own one-item plan (decode windows)
++    sh_counts: u64 = 0,
++    sh_members: u64 = 0,
+ 
+     /// Carves it from `t` (the engine's scratch taker) for `most` rows.
+     pub fn carve(t: anytype, g: E.Geometry, most: usize) !Scratch {
+@@ -36,6 +44,9 @@ pub const Scratch = struct {
+             .hist = try t.alloc(((pairs + 1023) / 1024) * count * 4),
+             .act = try t.alloc(pairs * g.intermediate * 2),
+             .y = try t.alloc(pairs * g.hidden * 4),
++            .sh_items = try t.alloc(4 * 4),
++            .sh_counts = try t.alloc(2 * 4),
++            .sh_members = try t.alloc(64 * 4),
+         };
+     }
+ };
+@@ -52,6 +63,30 @@ pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, x: u64, out: u
+     const items = cuda.grouped.maxItems(pairs, count, tile);
+     const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
+     const grouped: cuda.experts.Grouped = .{ .affine4 = &e.experts, .affine3 = &e.experts3, .exl3 = if (e.kit) |k| &k.grouped else null };
++    // the shared expert needs nothing the router decides: it runs on its own stream beside the router, top-k and plan (DRAM
++    // idle there), through the same kernels over a one-item plan, while the routed plan skips it
++    const side = side_shared and !wide and layer.format == .exl3 and e.kit != null and total <= 16;
++    if (side) {
++        const kit = e.kit.?;
++        const sh: cuda.grouped.Plan = .{ .members = s.sh_members, .items = s.sh_items, .counts = s.sh_counts, .rank = s.rank, .hist = s.hist };
++        try e.fork.record(e.stream);
++        try e.side.wait(e.fork);
++        var a: cuda.Args = .{};
++        a.add(s.sh_items);
++        a.add(s.sh_counts);
++        a.add(s.sh_members);
++        a.add(@as(c_int, @intCast(total)));
++        a.add(@as(c_int, @intCast(slots)));
++        a.add(@as(c_int, @intCast(g.experts)));
++        try cuda.launch.launch(kit.experts.shared_plan, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 32 } }, e.side, &a);
++        const rin: cuda.experts.Rows = .{ .x = x, .stride = g.hidden, .slots = slots };
++        const ain: cuda.experts.Rows = .{ .x = s.act, .stride = g.intermediate };
++        const gside: cuda.experts.Grouped = .{ .exl3 = &kit.grouped_side };
++        try gside.decode(e.side, .up, rin, layer, sh, s.act, items, -1);
++        try gside.decode(e.side, .down_f32, ain, layer, sh, s.y, items, -1);
++        try e.join.record(e.side);
++    }
++    const skip: i32 = if (side) @intCast(g.experts) else -1;
+     try e.moe.route(e.stream, x, g.hidden, total, router, s.logits, g.hidden, count);
+     try e.moe.pick(e.stream, s.logits, s.picks, s.wts, total, g.experts, g.top_k);
+     try e.plan.route(e.stream, s.picks, pairs, count, tile, plan);
+@@ -72,8 +107,9 @@ pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, x: u64, out: u
+         try grouped.prompt(e.stream, .up, rows_in, layer, plan, s.act, items, -1);
+         try grouped.prompt(e.stream, .down_bf16, act_in, layer, plan, s.y, items, -1);
+     } else {
+-        try grouped.decode(e.stream, .up, rows_in, layer, plan, s.act, items, -1);
+-        try grouped.decode(e.stream, .down_f32, act_in, layer, plan, s.y, items, -1);
++        try grouped.decode(e.stream, .up, rows_in, layer, plan, s.act, items, skip);
++        try grouped.decode(e.stream, .down_f32, act_in, layer, plan, s.y, items, skip);
+     }
++    if (side) try e.stream.wait(e.join);
+     try e.moe.combine(e.stream, s.y, !wide, s.wts, out, total, slots, g.hidden);
+ }

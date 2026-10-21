@@ -1,0 +1,572 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mia <mia.ailab1@gmail.com>
+Date: Tue, 20 Oct 2026 22:21:35 +0300
+Subject: [PATCH] qwen35 exl3 prefill perf: dense tiles, fused mul1 prompt kernels, 2048-row chunks, warp router
+
+---
+ zig/kernels/cuda/exl3_experts.cu              | 52 +++++++++++++++----
+ zig/kernels/cuda/exl3_prompt.cuh              | 40 +++++++-------
+ zig/kernels/cuda/moe.cu                       | 32 ++++++++++++
+ zig/src/cuda/exl3_experts.zig                 |  2 +
+ zig/src/cuda/exl3_prompt.zig                  | 31 ++++++++++-
+ zig/src/cuda/moe.zig                          |  9 +++-
+ zig/src/families/qwen3_5/cuda_bf16.zig        |  9 +++-
+ zig/src/families/qwen3_5/cuda_engine.zig      |  3 +-
+ .../families/qwen3_5/cuda_exl3_weights.zig    | 13 ++++-
+ zig/src/families/qwen3_5/cuda_forward.zig     |  4 +-
+ zig/src/families/qwen3_5/cuda_native.zig      | 14 ++---
+ zig/src/families/qwen3_5/cuda_round.zig       |  2 +-
+ zig/src/families/qwen3_5/cuda_routed.zig      | 17 ++++++
+ zig/src/families/qwen3_5/cuda_shapes.zig      |  7 +--
+ 14 files changed, 188 insertions(+), 47 deletions(-)
+
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index ecb651d..aa93086 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -455,32 +455,50 @@ extern "C" __global__ void tf_exl3_prompt_rotate(const __nv_bfloat16* __restrict
+     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
+ }
+ 
++template <int K2, int CB>
++__device__ __forceinline__ void prompt_gu_body(const half* __restrict__ Xg, const half* __restrict__ Xu,
++        const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
++        const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
++        half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode, int e_lo, int e_hi) {
++    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<K2>()];   // one buffer for either instantiation
++    __shared__ int rows_sh[TPM];
++    if (xdiv > 1) tgateup<TPM, K2, CB>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, smem_raw, rows_sh, e_lo, e_hi);
++    else tgateup<2 * TPM, K2, CB>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, 1, limit, act_mode, smem_raw, rows_sh, e_lo, e_hi);
++}
++
+ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu(const half* __restrict__ Xg, const half* __restrict__ Xu,
+         const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
+         const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
+         half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode) {
+-
+-    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes()];   // one buffer for either instantiation
+-    __shared__ int rows_sh[TPM];
+-    if (xdiv > 1) tgateup<TPM>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, smem_raw, rows_sh);
+-    else tgateup<2 * TPM>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, 1, limit, act_mode, smem_raw, rows_sh);
++    prompt_gu_body<8, CB_MCG>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, 0, 0x7fffffff);
++}
++#define TF_PROMPT_GU_MUL1(NAME, K2) \
++extern "C" __global__ void __launch_bounds__(256, 2) NAME(const half* __restrict__ Xg, const half* __restrict__ Xu, \
++        const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts, \
++        const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d, \
++        half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode, int e_lo, int e_hi) { \
++    prompt_gu_body<K2, CB_MUL1>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, e_lo, e_hi); \
+ }
++TF_PROMPT_GU_MUL1(tf_exl3_prompt_gu_m8, 8)
++TF_PROMPT_GU_MUL1(tf_exl3_prompt_gu_m10, 10)
+ 
+-// Block (256 model-width columns, item): y[row][slot][:] = the down epilogue of the item's pairs (this rank's share).
+-extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
++template <int K2, int CB>
++__device__ __forceinline__ void prompt_down_body(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
+         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+-        float* __restrict__ y, int K, int D, int ys) {
++        float* __restrict__ y, int K, int D, int ys, int e_lo, int e_hi)
++{
+ 
+-    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes()];
++    __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<K2>()];
+     __shared__ int rows_sh[TPM];
+     const int cb = blockIdx.x, item = blockIdx.y;
+     if (item >= counts[0]) return;
+     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
++    if (e < e_lo || e >= e_hi) return;
+     if (threadIdx.x < TPM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
+     __syncthreads();
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     float acc[TMT][TNB][4];
+-    tmain<1, TPM>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
++    tmain<1, TPM, K2, CB>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
+     float* Ed = reinterpret_cast<float*>(smem_raw);
+     for (int hf = 0; hf < 2 && hf * TPH < cnt; ++hf) {
+         if (hf) __syncthreads();
+@@ -502,3 +520,17 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const h
+         }
+     }
+ }
++
++extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
++        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
++        float* __restrict__ y, int K, int D, int ys) {
++    prompt_down_body<8, CB_MCG>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, 0, 0x7fffffff);
++}
++#define TF_PROMPT_DOWN_MUL1(NAME, K2) \
++extern "C" __global__ void __launch_bounds__(256, 2) NAME(const half* __restrict__ Xd, const uint64_t* __restrict__ Td, \
++        const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d, \
++        float* __restrict__ y, int K, int D, int ys, int e_lo, int e_hi) { \
++    prompt_down_body<K2, CB_MUL1>(Xd, Td, items, counts, members, svh_d, y, K, D, ys, e_lo, e_hi); \
++}
++TF_PROMPT_DOWN_MUL1(tf_exl3_prompt_down_m8, 8)
++TF_PROMPT_DOWN_MUL1(tf_exl3_prompt_down_m10, 10)
+diff --git a/zig/kernels/cuda/exl3_prompt.cuh b/zig/kernels/cuda/exl3_prompt.cuh
+index 067c3aa..66fb463 100644
+--- a/zig/kernels/cuda/exl3_prompt.cuh
++++ b/zig/kernels/cuda/exl3_prompt.cuh
+@@ -2,12 +2,13 @@
+ #pragma once
+ namespace tf_exl3_prompt {
+ using namespace tf_exl3;
++template <int K2 = 8, int CB = CB_MCG>
+ __device__ __forceinline__ void decode_tile_p(const uint32_t* tile, int lane, uint32_t (&b0)[2], uint32_t (&b1)[2]) {
+-    uint32_t w[lane_words<8>()];
++    uint32_t w[lane_words<K2>()];
+     int word, offset;
+-    lane_start<8>(lane, word, offset);
+-    for (int i = 0; i < lane_words<8>(); ++i) w[i] = tile[(word + i) % tile_words<8>()];
+-    decode_lane<8, CB_MCG>(w, lane, b0, b1);
++    lane_start<K2>(lane, word, offset);
++    for (int i = 0; i < lane_words<K2>(); ++i) w[i] = tile[(word + i) % tile_words<K2>()];
++    decode_lane<K2, CB>(w, lane, b0, b1);
+ }
+ __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
+     const unsigned d = (unsigned)__cvta_generic_to_shared(dst);
+@@ -27,12 +28,14 @@ namespace tf_exl3_prompt {
+ 
+ constexpr int TPM = 64, TNW = 8, TMT = 16 / TNW, TNB = TPM / 8, TT = TNW * 32, TPH = TPM / 2;
+ constexpr int TBK = 32, TKT = TBK / 16, TSTAGES = 3, TXS = TBK + 8;
+-constexpr int TWORDS = 16 * TKT * 32;
++template <int K2>
++constexpr int twords() { return 16 * TKT * tile_words<K2>(); }
+ constexpr int GU_ES = 128 + 4, DN_ES = 256 + 4;                        // the epilogue sums' row strides (floats)
+-template <int XR>
+-constexpr int tstage_halves() { return XR * TXS + 2 * TWORDS; }
++template <int XR, int K2 = 8>
++constexpr int tstage_halves() { return XR * TXS + 2 * twords<K2>(); }
++template <int K2 = 8>
+ constexpr int tsmem_bytes() {
+-    const int gu = TSTAGES * tstage_halves<2 * TPM>() * 2;   // gate and up rows apart (no shared rotation)
++    const int gu = TSTAGES * tstage_halves<2 * TPM, K2>() * 2;   // gate and up rows apart (no shared rotation)
+     const int ep = 2 * TPH * GU_ES * 4, dn = TPH * DN_ES * 4;
+     return gu > ep ? (gu > dn ? gu : dn) : (ep > dn ? ep : dn);
+ }
+@@ -45,11 +48,11 @@ __device__ __forceinline__ void ttile(int q, int cb, int& mat, int& nt) {
+ }
+ 
+ // Main loop: acc[i][nb] = warp tile i x members nb * 8 .. + 7 over K; XR rows a stage (TPM if X0 == X1, else 2 TPM).
+-template <int MATS, int XR>
++template <int MATS, int XR, int K2 = 8, int CB = CB_MCG>
+ __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* __restrict__ X1, const uint64_t* __restrict__ tp0,
+         const uint64_t* __restrict__ tp1, const int* rows_sh, int cnt, int e, int K, int NTILES, int cb, int xdiv,
+         half* stage, float (&acc)[TMT][TNB][4]) {
+-    constexpr int SH = tstage_halves<XR>();
++    constexpr int SH = tstage_halves<XR, K2>();
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     int mat, nt_unused;
+     ttile<MATS>(warp * TMT, cb, mat, nt_unused);
+@@ -74,12 +77,12 @@ __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* _
+             cp_async16(dst + ((size_t)m * TPM + i) * TXS + j * 8, src, r >= 0);
+         }
+         uint32_t* wdst = reinterpret_cast<uint32_t*>(dst + (size_t)XR * TXS);
+-        for (int idx = threadIdx.x; idx < 16 * TKT * 8; idx += TT) {   // 16-byte pieces of the 128-byte tile words
+-            const int q = idx / (TKT * 8), kk = (idx / 8) % TKT, part = idx % 8;
++        for (int idx = threadIdx.x; idx < 16 * TKT * K2; idx += TT) {   // 16-byte pieces of the 16 * K2-byte tile words
++            const int q = idx / (TKT * K2), kk = (idx / K2) % TKT, part = idx % K2;
+             int wm, nt;
+             ttile<MATS>(q, cb, wm, nt);
+-            const uint32_t* src = (wm ? T1 : T0) + (((size_t)chunk * TKT + kk) * NTILES + nt) * 32 + part * 4;
+-            cp_async16(wdst + ((size_t)q * TKT + kk) * 32 + part * 4, src, true);
++            const uint32_t* src = (wm ? T1 : T0) + (((size_t)chunk * TKT + kk) * NTILES + nt) * tile_words<K2>() + part * 4;
++            cp_async16(wdst + ((size_t)q * TKT + kk) * tile_words<K2>() + part * 4, src, true);
+         }
+     };
+ #pragma unroll
+@@ -101,7 +104,7 @@ __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* _
+ #pragma unroll
+             for (int i = 0; i < TMT; ++i) {
+                 uint32_t b0[2], b1[2];
+-                decode_tile_p(ws + ((size_t)(warp * TMT + i) * TKT + kk) * 32, lane, b0, b1);
++                decode_tile_p<K2, CB>(ws + ((size_t)(warp * TMT + i) * TKT + kk) * tile_words<K2>(), lane, b0, b1);
+                 a[i][0] = b0[0]; a[i][1] = b1[0]; a[i][2] = b0[1]; a[i][3] = b1[1];
+             }
+ #pragma unroll
+@@ -140,19 +143,20 @@ __device__ __forceinline__ void tspill(float* E, int ES, int col0, const float (
+         }
+ }
+ 
+-template <int XR>
++template <int XR, int K2 = 8, int CB = CB_MCG>
+ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half* __restrict__ Xu, const uint64_t* __restrict__ Tg,
+         const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members,
+         const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d, half* __restrict__ xd,
+-        int K, int N, int xdiv, float limit, int act_mode, unsigned char* smem_raw, int* rows_sh) {
++        int K, int N, int xdiv, float limit, int act_mode, unsigned char* smem_raw, int* rows_sh, int e_lo = 0, int e_hi = 0x7fffffff) {
+     const int cb = blockIdx.x, item = blockIdx.y;
+     if (item >= counts[0]) return;
+     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
++    if (e < e_lo || e >= e_hi) return;
+     if (threadIdx.x < TPM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
+     __syncthreads();
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     float acc[TMT][TNB][4];
+-    tmain<2, XR>(Xg, Xu, Tg, Tu, rows_sh, cnt, e, K, N >> 4, cb, xdiv, reinterpret_cast<half*>(smem_raw), acc);
++    tmain<2, XR, K2, CB>(Xg, Xu, Tg, Tu, rows_sh, cnt, e, K, N >> 4, cb, xdiv, reinterpret_cast<half*>(smem_raw), acc);
+     float* Eg = reinterpret_cast<float*>(smem_raw);
+     int mat, nt;
+     ttile<2>(warp * TMT, cb, mat, nt);
+diff --git a/zig/kernels/cuda/moe.cu b/zig/kernels/cuda/moe.cu
+index 2adb06a..113b215 100644
+--- a/zig/kernels/cuda/moe.cu
++++ b/zig/kernels/cuda/moe.cu
+@@ -38,6 +38,38 @@ extern "C" __global__ void __launch_bounds__(256) tf_moe_router(const __nv_bfloa
+     if (row0 + rr < R && e0 + ee < E) OUT[static_cast<int64_t>(row0 + rr) * E + e0 + ee] = acc;
+ }
+ 
++// Decode-sized rows (R <= 16): a warp per expert, its lanes striding 8 inputs each (16-byte loads), every row against the same
++// weights; lane sums are combined by a fixed shuffle tree, so a row's logits do not depend on R. Grid (E / 4), block 128.
++extern "C" __global__ void __launch_bounds__(128) tf_moe_router_rows(const __nv_bfloat16* __restrict__ X, int x_stride,
++                                                                       const __nv_bfloat16* __restrict__ W, float* __restrict__ OUT,
++                                                                       int R, int D, int E) {
++    const int e = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
++    if (e >= E) return;
++    float acc[16];
++#pragma unroll
++    for (int r = 0; r < 16; ++r) acc[r] = 0.0f;
++    const __nv_bfloat16* w = W + static_cast<int64_t>(e) * D;
++    for (int k = lane * 8; k < D; k += 256) {
++        uint4 wv = *reinterpret_cast<const uint4*>(w + k);
++        const __nv_bfloat16* wp = reinterpret_cast<const __nv_bfloat16*>(&wv);
++#pragma unroll
++        for (int r = 0; r < 16; ++r) {
++            if (r < R) {
++                uint4 xv = *reinterpret_cast<const uint4*>(X + static_cast<int64_t>(r) * x_stride + k);
++                const __nv_bfloat16* xp = reinterpret_cast<const __nv_bfloat16*>(&xv);
++#pragma unroll
++                for (int j = 0; j < 8; ++j) acc[r] = __fmaf_rn(bf(xp[j]), bf(wp[j]), acc[r]);
++            }
++        }
++    }
++#pragma unroll
++    for (int r = 0; r < 16; ++r) {
++#pragma unroll
++        for (int off = 16; off > 0; off >>= 1) acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], off);
++        if (lane == 0 && r < R) OUT[static_cast<int64_t>(r) * E + e] = acc[r];
++    }
++}
++
+ namespace {
+ 
+ constexpr int MAXC = 8;  // experts a lane holds: up to 256 routed experts
+diff --git a/zig/src/cuda/exl3_experts.zig b/zig/src/cuda/exl3_experts.zig
+index 4984b1a..d9dc6ce 100644
+--- a/zig/src/cuda/exl3_experts.zig
++++ b/zig/src/cuda/exl3_experts.zig
+@@ -34,6 +34,8 @@ pub const Layer = struct {
+     width: usize, // I (expert width)
+     codebook: Codebook,
+     uniform_k2: u32 = 0, // nonzero only when the loader verified this half-bit width for every projection
++    routed_k2: u32 = 0, // mixed widths: the half-bit width of experts 0 .. experts - 2 (the loader verified it)
++    tail_k2: u32 = 0, // ... and of the last expert (a shared expert), when it differs
+     shared_input: bool = false, // the loader verified identical gate/up input scales across every expert
+     gu_stride: usize = 0, // gate/up trellis row stride in tiles (0: contiguous per projection)
+     limit: f32 = 0, // the SwiGLU clamp (0: none)
+diff --git a/zig/src/cuda/exl3_prompt.zig b/zig/src/cuda/exl3_prompt.zig
+index 635540e..365191b 100644
+--- a/zig/src/cuda/exl3_prompt.zig
++++ b/zig/src/cuda/exl3_prompt.zig
+@@ -12,6 +12,11 @@ pub const Scratch = struct { xg: u64, xu: u64, xd: u64, y: u64, rows: usize, slo
+ pub fn eligible(l: ex.Layer) bool {
+     return l.codebook == .mcg and l.uniform_k2 == 8 and l.gu_stride == 0 and l.dims > 0 and l.width > 0 and l.dims % 256 == 0 and l.width % 128 == 0 and (l.act_mode == 0 or l.act_mode == 1);
+ }
++/// mul1 experts with one width for the routed experts and another for the last (the shared expert, Qwen3.5-MoE): the
++/// 4- and 5-bit instantiations launch over the same plan, each skipping the other's experts.
++pub fn mixedEligible(l: ex.Layer) bool {
++    return l.codebook == .mul1 and l.routed_k2 == 8 and l.tail_k2 == 10 and l.gu_stride == 0 and !l.shared_input and l.experts > 1 and l.dims > 0 and l.width > 0 and l.dims % 256 == 0 and l.width % 128 == 0 and (l.act_mode == 0 or l.act_mode == 1);
++}
+ fn mul(a: usize, b: usize) !usize {
+     return std.math.mul(usize, a, b) catch error.Exl3Shape;
+ }
+@@ -52,8 +57,32 @@ pub const Kernels = struct {
+     rotate: Function,
+     gateup: Function,
+     down: Function,
++    gu_m8: Function,
++    gu_m10: Function,
++    down_m8: Function,
++    down_m10: Function,
+     pub fn resolve(mod: Module) !Kernels {
+-        return .{ .rotate = try mod.function("tf_exl3_prompt_rotate"), .gateup = try mod.function("tf_exl3_prompt_gu"), .down = try mod.function("tf_exl3_prompt_down") };
++        return .{
++            .rotate = try mod.function("tf_exl3_prompt_rotate"), .gateup = try mod.function("tf_exl3_prompt_gu"), .down = try mod.function("tf_exl3_prompt_down"),
++            .gu_m8 = try mod.function("tf_exl3_prompt_gu_m8"), .gu_m10 = try mod.function("tf_exl3_prompt_gu_m10"),
++            .down_m8 = try mod.function("tf_exl3_prompt_down_m8"), .down_m10 = try mod.function("tf_exl3_prompt_down_m10"),
++        };
++    }
++
++    /// `run` over a plan the caller already built (tile 64) for `mixedEligible` layers: xg and xu are fp16 [pairs, dims]
++    /// scratch, xd fp16 [pairs, width], y fp32 [pairs, dims]; items bounds the plan's items.
++    pub fn runMixed(k: Kernels, e: *const ex.Experts, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, slots: usize, xg: u64, xu: u64, xd: u64, y: u64, p: grouped.Plan, items: usize) !void {
++        if (!mixedEligible(l) or rows == 0 or stride < l.dims or stride > std.math.maxInt(i32)) return error.Exl3Shape;
++        const pairs = rows * slots;
++        var args: launch.Args = .{};
++        inline for (.{ x, i(stride), @as(i32, @backingInt(ex.DType.bf16)), picks, l.suh_g, l.suh_u, xg, xu, i(l.dims), i(slots), i(l.experts) }) |v| args.add(v);
++        try launch.launch(e.rot_in, .{ .grid = .{ .x = @intCast(pairs), .y = @intCast(l.dims / 128), .z = 2 }, .block = .{ .x = 32 } }, s, &args);
++        const tail = i(l.experts - 1);
++        const fs = [2]Function{ k.gu_m8, k.gu_m10 };
++        const ds = [2]Function{ k.down_m8, k.down_m10 };
++        const ranges = [2][2]i32{ .{ 0, tail }, .{ tail, i(l.experts) } };
++        for (fs, ranges) |f, r| try go(f, s, .{ l.width / 128, items, 1 }, 256, .{ xg, xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, xd, i(l.dims), i(l.width), i(1), l.limit, l.act_mode, r[0], r[1] });
++        for (ds, ranges) |f, r| try go(f, s, .{ l.dims / 256, items, 1 }, 256, .{ xd, l.down, p.items, p.counts, p.members, l.svh_d, y, i(l.width), i(l.dims), i(slots), r[0], r[1] });
+     }
+     pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan) !void {
+         if (!eligible(l) or rows == 0 or rows > sc.rows or stride < l.dims or stride > std.math.maxInt(i32)) return error.Exl3Shape;
+diff --git a/zig/src/cuda/moe.zig b/zig/src/cuda/moe.zig
+index d293ae7..48548b0 100644
+--- a/zig/src/cuda/moe.zig
++++ b/zig/src/cuda/moe.zig
+@@ -14,12 +14,15 @@ pub const max_top_k = 31;
+ 
+ pub const Fns = struct {
+     router_fn: Function,
++    router_rows_fn: Function,
++    /// Decode-sized calls (<= 16 rows) take the warp-per-expert router (its logits differ from the tile kernel's in the last bits).
++    fast_rows: bool = false,
+     topk_fn: Function,
+     combine_fn: Function,
+ 
+     /// From the loaded moe module (kernels.moe).
+     pub fn resolve(mod: Module) !Fns {
+-        return .{ .router_fn = try mod.function("tf_moe_router"), .topk_fn = try mod.function("tf_moe_topk"), .combine_fn = try mod.function("tf_moe_combine") };
++        return .{ .router_fn = try mod.function("tf_moe_router"), .router_rows_fn = try mod.function("tf_moe_router_rows"), .topk_fn = try mod.function("tf_moe_topk"), .combine_fn = try mod.function("tf_moe_combine") };
+     }
+ 
+     /// logits[r][e] = fp32 x[r] . w[e]: `rows` bf16 rows `x_stride` apart against `count` rows of `dims`, gate last.
+@@ -30,6 +33,10 @@ pub const Fns = struct {
+         a.add(w);
+         a.add(logits);
+         for ([_]usize{ rows, dims, count }) |v| a.add(int(v));
++        if (f.fast_rows and rows <= 16 and dims % 256 == 0 and x_stride % 8 == 0 and x % 16 == 0 and w % 16 == 0) {
++            const wide: launch_.Config = .{ .grid = .{ .x = @intCast((count + 3) / 4), .y = 1, .z = 1 }, .block = .{ .x = 128 } };
++            return launch_.launch(f.router_rows_fn, wide, s, &a);
++        }
+         const cfg: launch_.Config = .{ .grid = .{ .x = @intCast((rows + 15) / 16), .y = @intCast((count + 15) / 16), .z = 1 }, .block = .{ .x = 256 } };
+         try launch_.launch(f.router_fn, cfg, s, &a);
+     }
+diff --git a/zig/src/families/qwen3_5/cuda_bf16.zig b/zig/src/families/qwen3_5/cuda_bf16.zig
+index c5665ae..39e29b3 100644
+--- a/zig/src/families/qwen3_5/cuda_bf16.zig
++++ b/zig/src/families/qwen3_5/cuda_bf16.zig
+@@ -37,11 +37,16 @@ pub const Kernels = struct {
+         try cuda.launch.launch(k.embed_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = threads } }, s, &a);
+     }
+ 
+-    /// out[rows][n] = x[rows][k] @ w[n][k]^T, bf16 in and out, fp32 sums in a fixed order whatever `rows` is (rows <= 128).
++    /// out[rows][n] = x[rows][k] @ w[n][k]^T, bf16 in and out, fp32 sums in a fixed order whatever `rows` is (any count, in blocks of 128).
+     /// k % 8 == 0; x and w 16-byte aligned.
+     pub fn denseRows(kn: *const Kernels, s: cuda.Stream, x: u64, w: u64, out: u64, rows: usize, n: usize, k: usize) !void {
+         if (rows == 0 or n == 0) return;
+-        if (rows > 128 or k == 0 or k % 8 != 0 or k > std.math.maxInt(i32) or n > std.math.maxInt(i32) or x % 16 != 0 or w % 16 != 0) return error.RowShape;
++        if (rows > 128) { // 128-row blocks, each row's sum the same whatever the block
++            var at: usize = 0;
++            while (at < rows) : (at += 128) try kn.denseRows(s, x + at * k * 2, w, out + at * n * 2, @min(128, rows - at), n, k);
++            return;
++        }
++        if (k == 0 or k % 8 != 0 or k > std.math.maxInt(i32) or n > std.math.maxInt(i32) or x % 16 != 0 or w % 16 != 0) return error.RowShape;
+         var a: cuda.launch.Args = .{};
+         for ([_]u64{ x, w, out }) |v| a.add(v);
+         for ([_]usize{ n, k }) |v| a.add(@as(i32, @intCast(v)));
+diff --git a/zig/src/families/qwen3_5/cuda_engine.zig b/zig/src/families/qwen3_5/cuda_engine.zig
+index f5b752e..7e34c1a 100644
+--- a/zig/src/families/qwen3_5/cuda_engine.zig
++++ b/zig/src/families/qwen3_5/cuda_engine.zig
+@@ -20,7 +20,7 @@ const DeviceBuffer = cuda.DeviceBuffer;
+ const head_dim = geometry.head_dim;
+ 
+ /// Rows of one forward at most: a prompt chunk, or a shared round's windows.
+-pub const max_rows = 128;
++pub const max_rows = 2048;
+ /// Streams' windows in one forward at most.
+ pub const max_segs = Round.max_segs;
+ /// Rows of a verify forward at most: each row's logits are kept and drawn.
+@@ -219,6 +219,7 @@ pub const Engine = struct {
+         e.experts3 = try cuda.experts3.Affine3Experts.resolve(e.mods[14], e.mods[15], sms);
+         e.plan = try cuda.grouped.Router.resolve(e.mods[10]);
+         e.moe = try cuda.moe.Fns.resolve(e.mods[13]);
++        e.moe.fast_rows = std.c.getenv("TF_QWEN_ROUTER_TILE") == null;
+         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
+         inline for (@typeInfo(Keeps).@"struct".field_names) |name| @field(e.keeps, name) = try e.mods[6].function("tf_q35k_" ++ name);
+         e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .compact = try e.mods[9].function("tf_q35k_compact8") };
+diff --git a/zig/src/families/qwen3_5/cuda_exl3_weights.zig b/zig/src/families/qwen3_5/cuda_exl3_weights.zig
+index 7c9cc67..83389fe 100644
+--- a/zig/src/families/qwen3_5/cuda_exl3_weights.zig
++++ b/zig/src/families/qwen3_5/cuda_exl3_weights.zig
+@@ -8,6 +8,7 @@ const core = @import("core");
+ const geometry = @import("cuda_geometry.zig");
+ const engine = @import("cuda_engine.zig");
+ const b16 = @import("cuda_bf16.zig");
++const routed = @import("cuda_routed.zig");
+ 
+ const Engine = engine.Engine;
+ const Proj = engine.Proj;
+@@ -28,6 +29,8 @@ pub const Kit = struct {
+         const k = try gpa.create(Kit);
+         errdefer gpa.destroy(k);
+         k.dense = try cuda.exl3.Dense.load(d);
++        if (std.c.getenv("TF_QWEN_FUSED_PROMPT")) |v| routed.setFusedPrompt(v[0] != '0');
++        if (std.c.getenv("TF_QWEN_DENSE_TILES") == null or std.c.getenv("TF_QWEN_DENSE_TILES").?[0] != '0') k.dense.implementation = .tiles; // bf16 x/y, even halves, stored layout: Ornith's dense weights all qualify
+         errdefer k.dense.unload();
+         k.experts = try ex.Experts.load(d);
+         errdefer k.experts.unload();
+@@ -36,11 +39,13 @@ pub const Kit = struct {
+         k.grouped = .{ .d = d, .kernels = &k.experts };
+         // The grouped experts' scratch grows on first use; allocate it now, before any graph capture, for the widest call
+         // (up and down at the most items either tile gives).
+-        const pairs = engine.max_rows * g.slots();
++        const pairs = @min(engine.max_rows, 128) * g.slots(); // the generic grouped path (decode, verify, TF_QWEN_FUSED_PROMPT=0) takes 128 rows at most
+         const items = cuda.grouped.maxItems(pairs, g.experts + 1, 16);
+         const up = try cuda.exl3_grouped.Grouped.bytes(g.hidden, g.intermediate, items, try ex.plan(g.hidden, g.intermediate, true), 2);
+         const down = try cuda.exl3_grouped.Grouped.bytes(g.intermediate, g.hidden, items, try ex.plan(g.intermediate, g.hidden, false), 1);
+-        k.grouped.storage = try cuda.DeviceBuffer.alloc(d, @max(up, down));
++        // the fused prompt kernels keep a chunk's rotated gate and up rows (fp16, pairs x hidden each) here too
++        const fused = 4 * engine.max_rows * g.slots() * g.hidden;
++        k.grouped.storage = try cuda.DeviceBuffer.alloc(d, @max(@max(up, down), fused));
+         return k;
+     }
+ 
+@@ -206,6 +211,7 @@ pub fn experts(s: anytype, ck: *core.Checkpoint, p: []const u8) !cuda.experts.La
+     var suh: [3]u64 = undefined;
+     var svh: [3]u64 = undefined;
+     var buf: [200]u8 = undefined;
++    var mixed = true; // 4-bit routed experts and a 5-bit shared expert, in every projection: the fused prompt kernels take it
+     for (mods, 0..) |mod, m| {
+         const k = if (m == 2) g.intermediate else g.hidden;
+         const n = if (m == 2) g.hidden else g.intermediate;
+@@ -222,6 +228,7 @@ pub fn experts(s: anytype, ck: *core.Checkpoint, p: []const u8) !cuda.experts.La
+             const gr = try group(ck, base, n, k);
+             tp[e] = try s.put(gr.trellis.bytes);
+             widths[e] = @intCast(gr.halves);
++            if (gr.halves != (if (e < g.experts) @as(u32, 8) else 10)) mixed = false;
+             @memcpy(su[e * k * 2 ..][0 .. k * 2], gr.suh.bytes);
+             @memcpy(sv[e * n * 2 ..][0 .. n * 2], gr.svh.bytes);
+         }
+@@ -236,6 +243,8 @@ pub fn experts(s: anytype, ck: *core.Checkpoint, p: []const u8) !cuda.experts.La
+         .suh_g = suh[0], .suh_u = suh[1], .svh_g = svh[0], .svh_u = svh[1], .suh_d = suh[2], .svh_d = svh[2],
+         .experts = count, .dims = g.hidden, .width = g.intermediate,
+         .codebook = .mul1,
++        .routed_k2 = if (mixed) 8 else 0,
++        .tail_k2 = if (mixed) 10 else 0,
+         .limit = 0, // Qwen's SwiGLU is unclamped
+         .act_mode = 1, // fp32 silu(gate) * up
+     };
+diff --git a/zig/src/families/qwen3_5/cuda_forward.zig b/zig/src/families/qwen3_5/cuda_forward.zig
+index 43669ee..ddc6eca 100644
+--- a/zig/src/families/qwen3_5/cuda_forward.zig
++++ b/zig/src/families/qwen3_5/cuda_forward.zig
+@@ -126,8 +126,8 @@ test "prompt MoE precision: target piece arithmetic keeps the shipped 16-row bou
+     try std.testing.expectEqual(@as(usize, 0), mismatches);
+ }
+ 
+-test "prompt MoE precision: every prompt piece through 128 and admitted verify width keeps its recipe" {
++test "prompt MoE precision: every prompt piece through max_rows and admitted verify width keeps its recipe" {
+     const std = @import("std");
+-    for (1..129) |rows| try std.testing.expectEqual(rows > 16, promptMoe(true, rows));
++    for (1..E.max_rows + 1) |rows| try std.testing.expectEqual(rows > 16, promptMoe(true, rows));
+     for (1..E.most_window + 1) |rows| try std.testing.expect(!promptMoe(false, rows));
+ }
+diff --git a/zig/src/families/qwen3_5/cuda_native.zig b/zig/src/families/qwen3_5/cuda_native.zig
+index d783449..65a45c6 100644
+--- a/zig/src/families/qwen3_5/cuda_native.zig
++++ b/zig/src/families/qwen3_5/cuda_native.zig
+@@ -199,12 +199,14 @@ fn coldCut(len: usize, chunks: []const u32, pos: usize) bool {
+ }
+ 
+ test "a pass resumes only where a cold pass cuts: every max_rows rows from 0 or from the request's chunk starts" {
+-    try std.testing.expect(coldCut(1000, &.{}, E.max_rows * 3));
+-    try std.testing.expect(!coldCut(1000, &.{}, E.max_rows * 3 + 1));
+-    try std.testing.expect(coldCut(1000, &.{200}, 200));
+-    try std.testing.expect(coldCut(1000, &.{200}, 200 + E.max_rows));
+-    try std.testing.expect(!coldCut(1000, &.{200}, 2 * E.max_rows)); // cut at 200 instead, then 328
+-    try std.testing.expectEqual(@as(usize, 200), nextCut(1000, &.{200}, E.max_rows));
++    const len = 8 * E.max_rows - 24;
++    try std.testing.expect(coldCut(len, &.{}, E.max_rows * 3));
++    try std.testing.expect(!coldCut(len, &.{}, E.max_rows * 3 + 1));
++    try std.testing.expect(coldCut(len, &.{200}, 200));
++    try std.testing.expect(coldCut(len, &.{200}, 200 + E.max_rows));
++    try std.testing.expect(!coldCut(len, &.{200}, 2 * E.max_rows)); // cut at 200 instead, then 200 + max_rows
++    try std.testing.expectEqual(@as(usize, 200), nextCut(len, &.{200}, 0));
++    try std.testing.expectEqual(@as(usize, 200 + E.max_rows), nextCut(len, &.{200}, 200));
+ }
+ 
+ fn release(p: *anyopaque) void {
+diff --git a/zig/src/families/qwen3_5/cuda_round.zig b/zig/src/families/qwen3_5/cuda_round.zig
+index 5a2e191..dc6a435 100644
+--- a/zig/src/families/qwen3_5/cuda_round.zig
++++ b/zig/src/families/qwen3_5/cuda_round.zig
+@@ -4,7 +4,7 @@ const slots = @import("core").tree_slots;
+ const Seg = @import("cuda_cache.zig").Seg;
+ const Rule = @import("cuda").sample.Rule;
+ pub const Path = @import("cuda_cache.zig").Path;
+-pub const max_rows = 128;
++pub const max_rows = 2048;
+ pub const max_segs = 128;
+ pub const most_verify = 128;
+ pub const most_window = 64;
+diff --git a/zig/src/families/qwen3_5/cuda_routed.zig b/zig/src/families/qwen3_5/cuda_routed.zig
+index 70abdcf..67432a6 100644
+--- a/zig/src/families/qwen3_5/cuda_routed.zig
++++ b/zig/src/families/qwen3_5/cuda_routed.zig
+@@ -2,6 +2,12 @@
+ const cuda = @import("cuda");
+ const E = @import("cuda_engine.zig");
+ 
++/// The fused mul1 prompt kernels (TF_QWEN_FUSED_PROMPT=0 falls back to the generic grouped path).
++var fused_prompt: bool = true;
++pub fn setFusedPrompt(on: bool) void {
++    fused_prompt = on;
++}
++
+ /// The routed rows' scratch: logits, picks and weights a row, the plan, the pairs' activations and sums.
+ pub const Scratch = struct {
+     logits: u64 = 0,
+@@ -50,6 +56,17 @@ pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, x: u64, out: u
+     try e.plan.route(e.stream, s.picks, pairs, count, tile, plan);
+     const rows_in: cuda.experts.Rows = .{ .x = x, .stride = g.hidden, .slots = slots };
+     const act_in: cuda.experts.Rows = .{ .x = s.act, .stride = g.intermediate };
++    if (wide and fused_prompt and layer.format == .exl3 and e.kit != null and cuda.exl3_experts.prompt.mixedEligible(layer.exl3.?)) {
++        // Fused tensor-core prompt kernels over the plan above: the grouped scratch holds the rotated gate and up rows,
++        // the activation scratch the rotated down inputs (fp16), y the fp32 expert outputs.
++        const kit = e.kit.?;
++        const store = kit.grouped.storage.?;
++        const rot = pairs * g.hidden * 2;
++        if (store.len < 2 * rot) return error.Exl3Scratch;
++        try kit.experts.prompt.runMixed(&kit.experts, e.stream, layer.exl3.?, x, g.hidden, s.picks, total, slots, store.ptr, store.ptr + rot, s.act, s.y, plan, items);
++        return e.moe.combine(e.stream, s.y, true, s.wts, out, total, slots, g.hidden);
++    }
++    if (total > 128) return error.Exl3Shape; // the generic grouped scratch holds 128 rows
+     if (wide) {
+         try grouped.prompt(e.stream, .up, rows_in, layer, plan, s.act, items, -1);
+         try grouped.prompt(e.stream, .down_bf16, act_in, layer, plan, s.y, items, -1);
+diff --git a/zig/src/families/qwen3_5/cuda_shapes.zig b/zig/src/families/qwen3_5/cuda_shapes.zig
+index b6fe8e9..c7f5c9c 100644
+--- a/zig/src/families/qwen3_5/cuda_shapes.zig
++++ b/zig/src/families/qwen3_5/cuda_shapes.zig
+@@ -3,7 +3,7 @@ const std = @import("std");
+ const Round = @import("cuda_round.zig");
+ 
+ pub const Shape = struct {
+-    total: u8,
++    total: u16, // prompt chunks go to Round.max_rows; kept (record) shapes to most_verify
+     nseg: u8,
+     record: bool,
+     prompt: bool,
+@@ -12,13 +12,14 @@ pub const Shape = struct {
+     hidden: bool = false,
+ 
+     pub fn init(rows: usize, segments: usize, record: bool, taps: bool, slots: u8) Shape {
+-        std.debug.assert(rows > 0 and rows <= Round.most_verify and segments > 0 and segments <= rows);
++        std.debug.assert(rows > 0 and rows <= @as(usize, if (record) Round.most_verify else Round.max_rows) and segments > 0 and segments <= rows);
+         const bucket: usize = if (rows == 1) 1 else std.mem.alignForward(usize, rows, 16);
+         const windows = std.math.ceilPowerOfTwo(usize, segments) catch unreachable;
+         return .{ .total = @intCast(if (record) bucket else rows), .nseg = @intCast(if (record) windows else segments), .record = record, .prompt = !record, .taps = taps, .slots = slots };
+     }
+ 
++    /// Prompt shapes (total > 255) are never captured, so their key may fold the row count.
+     pub fn key(s: Shape) u32 {
+-        return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, s.slots) << 19 | @as(u32, @intFromBool(s.hidden)) << 27;
++        return @as(u32, s.total & 0xff) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, s.slots) << 19 | @as(u32, @intFromBool(s.hidden)) << 27;
+     }
+ };

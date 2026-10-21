@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mia <mia.ailab1@gmail.com>
+Date: Wed, 21 Oct 2026 08:18:24 +0300
+Subject: [PATCH] qwen35 TF_LOGITS_HASH debug
+
+---
+ zig/src/families/qwen3_5/cuda_native.zig | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/zig/src/families/qwen3_5/cuda_native.zig b/zig/src/families/qwen3_5/cuda_native.zig
+index 65a45c6..326dd99 100644
+--- a/zig/src/families/qwen3_5/cuda_native.zig
++++ b/zig/src/families/qwen3_5/cuda_native.zig
+@@ -352,6 +352,8 @@ const Lanes = struct {
+         const self = cast(ptr);
+         const cache = try self.cacheOf(stream);
+         if (position != cache.len) return error.InvalidQwenPosition;
++        // TF_LOGITS_HASH: the first token's logits as a hash, to compare builds' prompt passes bit for bit
++        if (std.c.getenv("TF_LOGITS_HASH") != null) std.debug.print("logits-hash {x:0>16} position {d}\n", .{ std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(cache.logits)), position });
+         return try draws.draw(self.gpa, cache.logits, stream.sampling, position, mask);
+     }
+ 

@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mia <mia.ailab1@gmail.com>
+Date: Wed, 21 Oct 2026 08:18:49 +0300
+Subject: [PATCH] qwen35 audit for 8192-row passes: position table stride, drafter absorb buffers
+
+---
+ zig/kernels/cuda/qwen35.cuh             | 2 +-
+ zig/src/families/qwen3_5/cuda_draft.zig | 3 ++-
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/zig/kernels/cuda/qwen35.cuh b/zig/kernels/cuda/qwen35.cuh
+index e0a8799..f376129 100644
+--- a/zig/kernels/cuda/qwen35.cuh
++++ b/zig/kernels/cuda/qwen35.cuh
+@@ -12,7 +12,7 @@ constexpr int HD = 256;   // attention head width
+ constexpr int MAXQ = 32;  // attention query heads at most
+ constexpr int MAXW = 64;  // a window's rows at most (the log's rows a stream)
+ constexpr int MAXCH = 64; // attention chunks a row at most (cuda_engine.zig's max_chunks)
+-constexpr int MAXR = 2048; // a forward's rows at most (cuda_engine.zig's max_rows, which strides the position table in cuda_engine.zig): an image chunk's position rows
++constexpr int MAXR = 8192; // a forward's rows at most: must equal cuda_engine.zig's max_rows, the stride of the staged position table (an image chunk's t, h, w rows)
+ 
+ // The model's widths: hidden, linear key heads, linear value heads, attention query and key/value heads, linear layers.
+ struct Geo {
+diff --git a/zig/src/families/qwen3_5/cuda_draft.zig b/zig/src/families/qwen3_5/cuda_draft.zig
+index 6883c19..3d98353 100644
+--- a/zig/src/families/qwen3_5/cuda_draft.zig
++++ b/zig/src/families/qwen3_5/cuda_draft.zig
+@@ -14,7 +14,8 @@ const dr = lanes.drafter;
+ const Stream = lanes.Stream;
+ 
+ /// Rows an absorb runs at once (the target's prompt chunks are at most this).
+-const max_rows = engine.max_rows;
++/// The absorb buffers: a drafter takes its window (2048 rows at most, cuda_draft_config.zig) a call, not a whole prompt pass.
++const max_rows = @min(engine.max_rows, 2048);
+ /// The logprob row's words (sample.cu's LP_WORDS) and its best-token capacity.
+ const lp_words = 3 + 2 * 20;
+ /// A hold's rows: the reference's 16-row blocks (dflash2.block), past the 8 the checkpoint was trained with.
